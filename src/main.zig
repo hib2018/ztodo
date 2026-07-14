@@ -1,15 +1,18 @@
 const std = @import("std");
+const ztodo = @import("ztodo");
 
-pub fn main(init: std.process.Init) !void {
-    const arena: std.mem.Allocator = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(arena);
+pub fn main(init: std.process.Init) u8 {
+    const args = init.minimal.args.toSlice(init.arena.allocator()) catch {
+        printError(init.io, "could not read command-line arguments.");
+        return 1;
+    };
 
-    if (args.len < 2) {
-        std.debug.print("Usage: ztodo <command>\n", .{});
-        return;
-    }
+    return ztodo.cli.run(init.gpa, init.io, init.environ_map, args);
+}
 
-    const command = args[1];
-
-    std.debug.print("command: {s}\n", .{command});
+fn printError(io: std.Io, message: []const u8) void {
+    var buffer: [512]u8 = undefined;
+    var writer = std.Io.File.stderr().writer(io, &buffer);
+    writer.interface.print("Error: {s}\n", .{message}) catch {};
+    writer.interface.flush() catch {};
 }
