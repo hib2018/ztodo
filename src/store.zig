@@ -18,24 +18,20 @@ pub const Data = struct {
     pub fn deinit(self: *Data) void {
         for (self.tasks.items) |task| {
             self.allocator.free(task.title);
-            self.allocator.free(task.created_at);
         }
         self.tasks.deinit(self.allocator);
         self.* = undefined;
     }
 
-    pub fn add(self: *Data, title_input: []const u8, created_at: []const u8) !*const Task {
+    pub fn add(self: *Data, title_input: []const u8) !*const Task {
         const title = try task_mod.trimmedTitle(title_input);
         const title_copy = try self.allocator.dupe(u8, title);
         errdefer self.allocator.free(title_copy);
-        const time_copy = try self.allocator.dupe(u8, created_at);
-        errdefer self.allocator.free(time_copy);
 
         try self.tasks.append(self.allocator, .{
             .id = self.next_id,
             .title = title_copy,
             .status = .todo,
-            .created_at = time_copy,
         });
         self.next_id += 1;
         return &self.tasks.items[self.tasks.items.len - 1];
@@ -64,7 +60,6 @@ pub const Data = struct {
         const count = self.tasks.items.len;
         for (self.tasks.items) |task| {
             self.allocator.free(task.title);
-            self.allocator.free(task.created_at);
         }
         self.tasks.clearRetainingCapacity();
         self.next_id = 1;
@@ -79,7 +74,9 @@ const DiskData = struct {
 };
 
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Data {
-    var parsed = std.json.parseFromSlice(DiskData, allocator, bytes, .{}) catch return error.InvalidJson;
+    // schema_version still guards incompatible formats; ignoring removed fields
+    // keeps data written by older versions readable.
+    var parsed = std.json.parseFromSlice(DiskData, allocator, bytes, .{ .ignore_unknown_fields = true }) catch return error.InvalidJson;
     defer parsed.deinit();
     if (parsed.value.schema_version != schema_version) return error.UnsupportedSchemaVersion;
 
@@ -89,13 +86,10 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Data {
     for (parsed.value.tasks) |task| {
         const title = try allocator.dupe(u8, task.title);
         errdefer allocator.free(title);
-        const created_at = try allocator.dupe(u8, task.created_at);
-        errdefer allocator.free(created_at);
         try data.tasks.append(allocator, .{
             .id = task.id,
             .title = title,
             .status = task.status,
-            .created_at = created_at,
         });
     }
     std.mem.sort(Task, data.tasks.items, {}, struct {
@@ -134,21 +128,16 @@ pub fn save(allocator: std.mem.Allocator, io: std.Io, path: []const u8, data: *c
     atomic.replace(io) catch return error.WriteFailed;
 }
 
-const fixed_time = "2026-07-14T12:00:00Z";
-
 test "task operations preserve monotonic ids and idempotent completion" {
     var data = Data.init(std.testing.allocator);
     defer data.deinit();
-    const first = try data.add(" first ", fixed_time);
+    const first = try data.add(" first ");
     try std.testing.expectEqual(@as(u64, 1), first.id);
     try std.testing.expectEqual(Status.todo, first.status);
-    _ = try data.add("second", fixed_time);
+    _ = try data.add("second");
     const deleted = try data.delete(1);
-    defer {
-        data.allocator.free(deleted.title);
-        data.allocator.free(deleted.created_at);
-    }
-    const third = try data.add("third", fixed_time);
+    defer data.allocator.free(deleted.title);
+    const third = try data.add("third");
     try std.testing.expectEqual(@as(u64, 3), third.id);
     try std.testing.expect(try data.complete(3));
     try std.testing.expect(!(try data.complete(3)));
@@ -159,20 +148,20 @@ test "task operations preserve monotonic ids and idempotent completion" {
 test "clear removes tasks and resets the next id" {
     var data = Data.init(std.testing.allocator);
     defer data.deinit();
-    _ = try data.add("first", fixed_time);
-    _ = try data.add("second", fixed_time);
+    _ = try data.add("first");
+    _ = try data.add("second");
 
     try std.testing.expectEqual(@as(usize, 2), data.clear());
     try std.testing.expectEqual(@as(usize, 0), data.tasks.items.len);
     try std.testing.expectEqual(@as(u64, 1), data.next_id);
-    try std.testing.expectEqual(@as(u64, 1), (try data.add("new", fixed_time)).id);
+    try std.testing.expectEqual(@as(u64, 1), (try data.add("new")).id);
 }
 
 test "JSON round trip supports unicode quotes statuses and next id" {
     var data = Data.init(std.testing.allocator);
     defer data.deinit();
-    _ = try data.add("日本語と\"引用符\"", fixed_time);
-    _ = try data.add("todo", "2026-07-14T12:10:00Z");
+    _ = try data.add("日本語と\"引用符\"");
+    _ = try data.add("todo");
     _ = try data.complete(1);
     const json = try encode(std.testing.allocator, &data);
     defer std.testing.allocator.free(json);
@@ -182,6 +171,19 @@ test "JSON round trip supports unicode quotes statuses and next id" {
     try std.testing.expectEqualStrings("日本語と\"引用符\"", restored.tasks.items[0].title);
     try std.testing.expectEqual(Status.done, restored.tasks.items[0].status);
     try std.testing.expectEqual(Status.todo, restored.tasks.items[1].status);
+}
+
+test "legacy JSON with created_at remains readable and is rewritten without it" {
+    const legacy =
+        \\{"schema_version":1,"next_id":2,"tasks":[{"id":1,"title":"legacy","status":"todo","created_at":"2026-07-14T12:00:00Z"}]}
+    ;
+    var data = try decode(std.testing.allocator, legacy);
+    defer data.deinit();
+    try std.testing.expectEqualStrings("legacy", data.tasks.items[0].title);
+
+    const json = try encode(std.testing.allocator, &data);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "created_at") == null);
 }
 
 test "unknown schema and corrupt JSON are rejected" {

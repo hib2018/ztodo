@@ -1,0 +1,62 @@
+#compdef ztodo
+
+_ztodo_task_ids() {
+  local line
+  local -a tasks
+
+  for line in "${(@f)$(ztodo ls 2>/dev/null)}"; do
+    if [[ "$line" =~ '^\[[ x]\] ([0-9]+)  (.*)$' ]]; then
+      tasks+=("${match[1]}:${match[2]}")
+    fi
+  done
+
+  if (( ${#tasks} )); then
+    _describe -t tasks 'task' tasks
+  else
+    _message 'no tasks'
+  fi
+}
+
+_ztodo() {
+  local context state state_descr line
+  typeset -A opt_args
+  local -a commands
+
+  commands=(
+    'add:Add a task'
+    'ls:List todo and done tasks'
+    'done:Mark a task as done'
+    'del:Delete a task without confirmation'
+    'clear:Delete all tasks'
+    'issue:Select a GitHub Issue and copy an AI prompt'
+    'import:Import Proposal JSON from the clipboard'
+    'prop:Review, edit, and approve the current Proposal'
+    'help:Show help'
+    'version:Show version'
+  )
+
+  _arguments -C \
+    '1:command:->command' \
+    '*::argument:->argument'
+
+  case "$state" in
+    command)
+      _describe -t commands 'ztodo command' commands
+      ;;
+    argument)
+      case "${words[2]}" in
+        add)
+          _message 'task title'
+          ;;
+        done|del)
+          _ztodo_task_ids
+          ;;
+        issue)
+          _message 'repository (owner/repo); omit to use the current repository'
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_ztodo "$@"

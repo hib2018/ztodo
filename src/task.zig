@@ -13,7 +13,6 @@ pub const Task = struct {
     id: u64,
     title: []const u8,
     status: Status,
-    created_at: []const u8,
 };
 
 pub fn trimmedTitle(title: []const u8) error{EmptyTitle}![]const u8 {
