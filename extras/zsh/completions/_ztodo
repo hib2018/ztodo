@@ -28,6 +28,7 @@ _ztodo() {
     'done:Mark a task as done'
     'del:Delete a task without confirmation'
     'clear:Delete all tasks'
+    'repo:Manage configured GitHub repositories'
     'issue:Select a GitHub Issue and copy an AI prompt'
     'import:Import Proposal JSON from the clipboard'
     'prop:Review, edit, and approve the current Proposal'
@@ -52,7 +53,23 @@ _ztodo() {
           _ztodo_task_ids
           ;;
         issue)
-          _message 'repository (owner/repo); omit to use the current repository'
+          _message 'repository (owner/repo); omit to use all configured repositories'
+          ;;
+        repo)
+          if (( CURRENT == 3 )); then
+            local -a repo_commands=(
+              'ls:List configured repositories'
+              'add:Add a repository'
+              'del:Remove a repository'
+            )
+            _describe -t repo-commands 'repo command' repo_commands
+          elif (( CURRENT == 4 )); then
+            case "${words[3]}" in
+              add|del)
+                _message 'repository (owner/repo)'
+                ;;
+            esac
+          fi
           ;;
       esac
       ;;

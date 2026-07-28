@@ -6,10 +6,12 @@ const proposal_store = @import("proposal_store.zig");
 const proposal_editor = @import("proposal_editor.zig");
 const workflow_apply = @import("workflow_apply.zig");
 const github_cli = @import("github_cli.zig");
+const github_config = @import("github_config.zig");
 const issue_selector = @import("issue_selector.zig");
 const ai_prompt = @import("ai_prompt.zig");
 const clipboard = @import("clipboard.zig");
 const workflow_clipboard_import = @import("workflow_clipboard_import.zig");
+const tui = @import("tui.zig");
 
 pub const version = "0.2.0";
 
@@ -17,13 +19,21 @@ pub const Command = union(enum) {
     help,
     version,
     ls,
+    tui,
     add: []const []const u8,
     done: u64,
     del: u64,
     clear,
+    repo: RepoCommand,
     prop,
     proposal_import,
     issue: ?[]const u8,
+};
+
+pub const RepoCommand = union(enum) {
+    ls,
+    add: []const u8,
+    del: []const u8,
 };
 
 pub fn parse(args: []const []const u8) !Command {
@@ -32,7 +42,27 @@ pub fn parse(args: []const []const u8) !Command {
     if (std.mem.eql(u8, name, "help")) return requireNoExtra(args, .help);
     if (std.mem.eql(u8, name, "version")) return requireNoExtra(args, .version);
     if (std.mem.eql(u8, name, "ls")) return requireNoExtra(args, .ls);
+    if (std.mem.eql(u8, name, "tui")) return requireNoExtra(args, .tui);
     if (std.mem.eql(u8, name, "clear")) return requireNoExtra(args, .clear);
+    if (std.mem.eql(u8, name, "repo")) {
+        if (args.len < 3) return error.MissingArgument;
+        const action = args[2];
+        if (std.mem.eql(u8, action, "ls")) {
+            if (args.len > 3) return error.UnexpectedArgument;
+            return .{ .repo = .ls };
+        }
+        if (std.mem.eql(u8, action, "add") or
+            std.mem.eql(u8, action, "del"))
+        {
+            if (args.len < 4) return error.MissingArgument;
+            if (args.len > 4) return error.UnexpectedArgument;
+            return .{ .repo = if (std.mem.eql(u8, action, "add"))
+                .{ .add = args[3] }
+            else
+                .{ .del = args[3] } };
+        }
+        return error.UnknownRepoCommand;
+    }
     if (std.mem.eql(u8, name, "prop")) return requireNoExtra(args, .prop);
     if (std.mem.eql(u8, name, "import")) return requireNoExtra(args, .proposal_import);
     if (std.mem.eql(u8, name, "issue")) {
@@ -86,9 +116,17 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
             environ,
             &stdout.interface,
         ),
+        .repo => |repo_command| return runRepo(
+            allocator,
+            io,
+            environ,
+            repo_command,
+            &stdout.interface,
+        ),
         .issue => |repository| return runGithubIssue(
             allocator,
             io,
+            environ,
             repository,
             &stdout.interface,
         ),
@@ -107,6 +145,12 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
     defer data.deinit();
 
     switch (command) {
+        .tui => {
+            tui.run(io, &data) catch |err| {
+                writeRuntimeError(io, err, 0);
+                return 1;
+            };
+        },
         .ls => {
             if (data.tasks.items.len == 0) stdout.interface.writeAll("No tasks.\n") catch return 1 else for (data.tasks.items) |task| stdout.interface.print("[{s}] {d}  {s}\n", .{ if (task.status == .done) "x" else " ", task.id, task.title }) catch return 1;
         },
@@ -150,6 +194,75 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
     return 0;
 }
 
+fn runRepo(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    command: RepoCommand,
+    stdout: *std.Io.Writer,
+) u8 {
+    const path = github_config.resolvePath(allocator, environ) catch |err| {
+        writeRepoError(io, err);
+        return 1;
+    };
+    defer allocator.free(path);
+    switch (command) {
+        .ls => {
+            var config = github_config.load(allocator, io, path) catch |err| {
+                if (err == error.GitHubConfigNotFound) {
+                    stdout.print(
+                        "No repositories configured.\nConfig: {s}\n",
+                        .{path},
+                    ) catch return 1;
+                    return 0;
+                }
+                writeRepoError(io, err);
+                return 1;
+            };
+            defer config.deinit();
+            if (config.repositories.len == 0) {
+                stdout.writeAll("No repositories configured.\n") catch return 1;
+            } else {
+                for (config.repositories) |repository| {
+                    stdout.print("{s}\n", .{repository}) catch return 1;
+                }
+            }
+            stdout.print("Config: {s}\n", .{path}) catch return 1;
+        },
+        .add => |repository| {
+            const count = github_config.addRepository(
+                allocator,
+                io,
+                path,
+                repository,
+            ) catch |err| {
+                writeRepoError(io, err);
+                return 1;
+            };
+            stdout.print(
+                "Added repository: {s}\nConfigured repositories: {d}\n",
+                .{ repository, count },
+            ) catch return 1;
+        },
+        .del => |repository| {
+            const count = github_config.removeRepository(
+                allocator,
+                io,
+                path,
+                repository,
+            ) catch |err| {
+                writeRepoError(io, err);
+                return 1;
+            };
+            stdout.print(
+                "Removed repository: {s}\nConfigured repositories: {d}\n",
+                .{ repository, count },
+            ) catch return 1;
+        },
+    }
+    return 0;
+}
+
 fn runProposalImport(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -185,22 +298,40 @@ fn runProposalImport(
 fn runGithubIssue(
     allocator: std.mem.Allocator,
     io: std.Io,
+    environ: *const std.process.Environ.Map,
     repository_argument: ?[]const u8,
     stdout: *std.Io.Writer,
 ) u8 {
-    const owned_repository = if (repository_argument == null)
-        github_cli.currentRepository(allocator, io) catch |err| {
+    var configured: ?github_config.Config = null;
+    defer if (configured) |*config| config.deinit();
+
+    var issues = if (repository_argument) |repository|
+        github_cli.listOpen(allocator, io, repository) catch |err| {
             writeGithubIssueError(io, err);
             return 1;
         }
-    else
-        null;
-    defer if (owned_repository) |repository| allocator.free(repository);
-    const repository = repository_argument orelse owned_repository.?;
-
-    var issues = github_cli.listOpen(allocator, io, repository) catch |err| {
-        writeGithubIssueError(io, err);
-        return 1;
+    else configured_block: {
+        const config_path = github_config.resolvePath(allocator, environ) catch |err| {
+            writeGithubIssueError(io, err);
+            return 1;
+        };
+        defer allocator.free(config_path);
+        configured = github_config.load(allocator, io, config_path) catch |err| {
+            writeGithubIssueError(io, err);
+            return 1;
+        };
+        if (configured.?.repositories.len == 0) {
+            writeGithubIssueError(io, error.NoConfiguredRepositories);
+            return 1;
+        }
+        break :configured_block github_cli.listOpenMany(
+            allocator,
+            io,
+            configured.?.repositories,
+        ) catch |err| {
+            writeGithubIssueError(io, err);
+            return 1;
+        };
     };
     defer issues.deinit();
 
@@ -218,7 +349,7 @@ fn runGithubIssue(
     var issue = github_cli.get(
         allocator,
         io,
-        repository,
+        issues.items[selected].repository,
         issues.items[selected].number,
     ) catch |err| {
         writeGithubIssueError(io, err);
@@ -342,9 +473,28 @@ fn writeParseError(io: std.Io, err: anyerror) void {
         error.MissingArgument => "missing required argument.",
         error.InvalidId => "id must be a positive integer.",
         error.UnexpectedArgument => "unexpected argument.",
+        error.UnknownRepoCommand => "repo supports `ls`, `add`, and `del`.",
         else => "invalid input.",
     };
     writeStderr(io, "Error: {s}\n\nUsage: ztodo <command> [arguments]\n", .{message});
+}
+
+fn writeRepoError(io: std.Io, err: anyerror) void {
+    const message = switch (err) {
+        error.InvalidRepository => "repository must use the `owner/repo` format.",
+        error.DuplicateConfiguredRepository => "repository is already configured.",
+        error.RepositoryNotConfigured => "repository is not configured.",
+        error.TooManyConfiguredRepositories => "no more than 20 repositories can be configured.",
+        error.GitHubConfigTooLarge => "GitHub repository config exceeds 64 KiB.",
+        error.GitHubConfigReadFailed => "GitHub repository config could not be read.",
+        error.InvalidGitHubConfig => "GitHub repository config contains invalid JSON or unknown fields.",
+        error.UnsupportedGitHubConfigVersion => "GitHub repository config uses an unsupported schema version.",
+        error.GitHubConfigWriteFailed => "GitHub repository config could not be saved.",
+        error.CreateConfigDirectoryFailed => "GitHub repository config directory could not be created.",
+        error.MissingHome => "HOME is not set and no config file override is available.",
+        else => "GitHub repository config operation failed.",
+    };
+    writeStderr(io, "Error: {s}\n", .{message});
 }
 
 fn writeProposalImportError(io: std.Io, err: anyerror) void {
@@ -386,6 +536,15 @@ fn writeGithubIssueError(io: std.Io, err: anyerror) void {
         error.GitHubCliFailed => "GitHub CLI failed. Check `gh auth status` and repository access.",
         error.GitHubCliOutputTooLarge => "GitHub CLI returned too much data.",
         error.GitHubCliExecutionFailed => "GitHub CLI could not be executed.",
+        error.GitHubConfigNotFound => "GitHub repository config was not found. Create `~/.config/ztodo/config.json`.",
+        error.GitHubConfigTooLarge => "GitHub repository config exceeds 64 KiB.",
+        error.GitHubConfigReadFailed => "GitHub repository config could not be read.",
+        error.InvalidGitHubConfig => "GitHub repository config contains invalid JSON or unknown fields.",
+        error.UnsupportedGitHubConfigVersion => "GitHub repository config uses an unsupported schema version.",
+        error.NoConfiguredRepositories => "GitHub repository config contains no repositories.",
+        error.TooManyConfiguredRepositories => "GitHub repository config contains more than 20 repositories.",
+        error.DuplicateConfiguredRepository => "GitHub repository config contains a duplicate repository.",
+        error.MissingHome => "HOME is not set and no config file override is available.",
         error.InvalidGitHubOutput => "GitHub CLI returned invalid issue data.",
         error.TooManyGitHubIssues => "GitHub CLI returned too many issues.",
         error.InvalidIssueSelection => "select a number shown in the issue list.",
@@ -409,6 +568,7 @@ fn writeRuntimeError(io: std.Io, err: anyerror, id: u64) void {
         error.UnsupportedSchemaVersion => "data file uses an unsupported schema version.",
         error.WriteFailed => "could not write the data file.",
         error.CreateDirectoryFailed => "could not create the data directory.",
+        error.NotATerminal => "tui requires both stdin and stdout to be terminals.",
         else => "operation failed.",
     };
     writeStderr(io, "Error: {s}\n", .{message});
@@ -460,19 +620,26 @@ pub const help_text =
     \\Commands:
     \\  add <title...>  Add a task; title arguments are joined with spaces
     \\  ls              List todo and done tasks in ID order
+    \\  tui             Open the interactive task interface
     \\  done <id>       Mark a task as done
     \\  del <id>        Delete one task without confirmation
     \\  clear           Delete all tasks and reset the next ID to 1
+    \\  repo ls         List configured GitHub repositories
+    \\  repo add <owner/repo>
+    \\                  Add a GitHub repository
+    \\  repo del <owner/repo>
+    \\                  Remove a GitHub repository
     \\  import          Import Proposal JSON from the clipboard
     \\  prop            Review, edit, and approve the current Proposal
     \\  issue [owner/repo]
-    \\                  Select an Issue and copy an AI prompt; defaults to the current repository
+    \\                  Select an Issue and copy an AI prompt; defaults to all configured repositories
     \\  help            Show this help
     \\  version         Show version
     \\
     \\Examples:
     \\  ztodo add READMEを 更新する
     \\  ztodo done 1
+    \\  ztodo repo add owner/repo
     \\  ztodo issue
     \\  ztodo import
     \\  ztodo prop
@@ -495,10 +662,29 @@ test "CLI argument parsing" {
     try std.testing.expectError(error.InvalidId, parse(&bad_del));
     const ls = [_][]const u8{ "ztodo", "ls" };
     try std.testing.expect((try parse(&ls)) == .ls);
+    const tui_command = [_][]const u8{ "ztodo", "tui" };
+    try std.testing.expect((try parse(&tui_command)) == .tui);
     const clear = [_][]const u8{ "ztodo", "clear" };
     try std.testing.expect((try parse(&clear)) == .clear);
     const clear_extra = [_][]const u8{ "ztodo", "clear", "now" };
     try std.testing.expectError(error.UnexpectedArgument, parse(&clear_extra));
+    const repo_ls = [_][]const u8{ "ztodo", "repo", "ls" };
+    try std.testing.expect((try parse(&repo_ls)).repo == .ls);
+    const repo_add = [_][]const u8{ "ztodo", "repo", "add", "owner/repo" };
+    try std.testing.expectEqualStrings(
+        "owner/repo",
+        (try parse(&repo_add)).repo.add,
+    );
+    const repo_del = [_][]const u8{ "ztodo", "repo", "del", "owner/repo" };
+    try std.testing.expectEqualStrings(
+        "owner/repo",
+        (try parse(&repo_del)).repo.del,
+    );
+    const repo_unknown = [_][]const u8{ "ztodo", "repo", "set" };
+    try std.testing.expectError(
+        error.UnknownRepoCommand,
+        parse(&repo_unknown),
+    );
     const prop = [_][]const u8{ "ztodo", "prop" };
     try std.testing.expect((try parse(&prop)) == .prop);
     const prop_extra = [_][]const u8{ "ztodo", "prop", "now" };

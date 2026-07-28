@@ -12,7 +12,10 @@ pub fn select(
     }
     try writer.writeAll("Open GitHub Issues\n\n");
     for (issues, 1..) |issue, index| {
-        try writer.print("{d}. #{d} {s}\n", .{ index, issue.number, issue.title });
+        try writer.print(
+            "{d}. {s}#{d} {s}\n",
+            .{ index, issue.repository, issue.number, issue.title },
+        );
     }
     try writer.writeAll("\nSelect an issue number (q to cancel): ");
     try writer.flush();
@@ -27,17 +30,26 @@ pub fn select(
 
 test "selects by displayed one-based number" {
     const issues = [_]github_cli.IssueSummary{
-        .{ .number = 12, .title = "first" },
-        .{ .number = 18, .title = "second" },
+        .{ .repository = "owner/one", .number = 12, .title = "first" },
+        .{ .repository = "owner/two", .number = 18, .title = "second" },
     };
     var reader: std.Io.Reader = .fixed("2\n");
     var output: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&output);
     try std.testing.expectEqual(@as(?usize, 1), try select(&issues, &reader, &writer));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        writer.buffered(),
+        "owner/two#18 second",
+    ) != null);
 }
 
 test "selection can be cancelled and rejects an out of range number" {
-    const issues = [_]github_cli.IssueSummary{.{ .number = 12, .title = "first" }};
+    const issues = [_]github_cli.IssueSummary{.{
+        .repository = "owner/repo",
+        .number = 12,
+        .title = "first",
+    }};
     var cancel_reader: std.Io.Reader = .fixed("q\n");
     var cancel_output: [1024]u8 = undefined;
     var cancel_writer = std.Io.Writer.fixed(&cancel_output);

@@ -1,20 +1,32 @@
 # ztodo
 
-ztodoは、「今から実行する作業」を管理する小さなCLIタスク管理ツールです。Zigで実装されています。
+ztodoは、GitHub Issueを「今から実行する具体的なTask」へ分解し、管理する小さなCLIツールです。Zigで実装されています。
 
-Markdownなどで中長期の作業を整理し、ztodoでは数十分から数時間程度の具体的なTaskを扱うことを想定しています。
+基本の流れは次のとおりです。
+
+```text
+Repositoryを登録
+  → GitHub Issueを選択
+  → プロンプトをAIへ貼り付け
+  → AIのProposal JSONを取り込む
+  → Proposalを編集・承認
+  → Taskを実行・完了
+```
 
 ## 必要な環境
 
 - Zig 0.16.0
-- macOS、LinuxなどZigが動作する環境
-- GitHub Issue連携を使う場合は、認証済みの[GitHub CLI](https://cli.github.com/)
+- GitHub CLI（`gh`）
+- macOSまたはLinux
+- クリップボードコマンド
+  - macOS：`pbcopy`、`pbpaste`
+  - Linux：`wl-copy`、`wl-paste`または`xclip`
 
-```sh
-gh auth login
-```
+ztodo自身はGitHub APIやAI APIを直接呼びません。GitHubの取得と認証は`gh`へ、Task分解は利用者が選んだAIへ任せます。
 
-## ビルド
+## セットアップ
+
+### 1. ビルド
 
 ```sh
 zig build
@@ -26,93 +38,106 @@ zig build
 ./zig-out/bin/ztodo help
 ```
 
-PATHから実行する場合は、例えば`~/.local/bin`へリンクします。
+PATHから実行する場合：
 
 ```sh
 mkdir -p ~/.local/bin
 ln -sfn "$(pwd)/zig-out/bin/ztodo" ~/.local/bin/ztodo
 ```
 
-### Zsh補完
+### 2. GitHub認証
 
-Zsh補完は任意機能です。ztodo本体の実行には必要ありません。関連ファイルは`extras/zsh/`へまとめています。
-
-`ztodo.plugin.zsh`を読み込むと、コマンドとTask IDをTab補完できます。
+通常はGitHub CLIのブラウザ認証を使用します。
 
 ```sh
-source /path/to/ztodo/ztodo.plugin.zsh
-autoload -Uz compinit && compinit
+gh auth login
+gh auth status
 ```
 
-例えば、次の位置でTabを押すと候補が表示されます。
+認証情報はztodoではなく、GitHub CLIが管理します。
+
+自動化環境などでTokenが必要な場合だけ、現在のシェルへ一時的に設定します。
 
 ```sh
-ztodo <Tab>       # コマンド候補
-ztodo done <Tab>  # Task IDとタイトル
-ztodo del <Tab>   # Task IDとタイトル
+export GH_TOKEN="your-token"
+gh auth status
+unset GH_TOKEN
 ```
 
-常に有効にする場合は、1行目の`source`を`~/.zshrc`へ追加します。プラグインマネージャーを使う場合は、このリポジトリを通常のZshプラグインとして読み込めます。
+`GITHUB_TOKEN`も利用できますが、両方ある場合は`GH_TOKEN`が優先されます。Tokenを`.zshrc`、`.env`、README、ztodoのデータへ保存したり、Gitへコミットしたりしないでください。
 
-通常のZsh補完だけでも動作します。別途`zsh-autocomplete`を導入している環境では、候補が入力中に自動表示されます。
+## 基本的な使い方
 
-## コマンド
+### 1. Repositoryを登録する
 
-| コマンド | 動作 |
-| --- | --- |
-| `ztodo add <title...>` | Taskを追加する |
-| `ztodo ls` | 全TaskをID順に表示する |
-| `ztodo done <id>` | Taskを完了にする |
-| `ztodo del <id>` | Taskを確認なしで削除する |
-| `ztodo clear` | 全Taskを削除し、次のIDを`1`へ戻す |
-| `ztodo issue [owner/repo]` | GitHub Issueを選び、AI向けプロンプトを表示・コピーする |
-| `ztodo import` | クリップボードのAI回答をProposalとして取り込む |
-| `ztodo prop` | Proposalを編集・承認してTaskへ登録する |
-| `ztodo help` | ヘルプを表示する |
-| `ztodo version` | バージョンを表示する |
-
-### Taskを操作する
+Issueを取得するRepositoryを登録します。
 
 ```sh
-ztodo add JSON保存処理を実装する
-ztodo ls
-ztodo done 1
-ztodo del 1
+ztodo repo add owner/repository-one
+ztodo repo add owner/repository-two
 ```
 
-一覧表示：
+登録内容を確認します。
 
-```text
-[ ] 1  JSON保存処理を実装する
-[x] 2  READMEを更新する
+```sh
+ztodo repo ls
 ```
 
-Taskは`id`、`title`、`status`だけを保持し、状態は`todo`または`done`です。空タイトルは登録できません。
+不要になったRepositoryは削除できます。
 
-`clear`と`del`には確認がなく、元に戻せません。
+```sh
+ztodo repo del owner/repository-two
+```
 
-## GitHub IssueからAI向けプロンプトを作る
+Repositoryは`owner/name`形式で最大20件まで登録でき、重複は拒否されます。設定は`~/.config/ztodo/config.json`へAtomic保存され、Tokenなどの秘密情報は含みません。
+
+### 2. GitHub Issueを選ぶ
+
+登録した全RepositoryからOpen Issueを取得します。
 
 ```sh
 ztodo issue
 ```
 
-現在のGitリポジトリで公開中のIssueが一覧表示されます。別のリポジトリを使う場合は`ztodo issue owner/repo`と指定します。番号を選ぶとIssue本文を含むProposal生成用プロンプトを標準出力へ表示し、クリップボードにもコピーします。`q`でキャンセルできます。
+```text
+Open GitHub Issues
 
-プロンプトを任意のAIへ貼り付け、返されたJSONをコピーして取り込みます。
+1. owner/repository-one#25 ロードマップを整理する
+2. owner/repository-two#10 TUIを実装する
+
+Select an issue number (q to cancel):
+```
+
+一つのRepositoryだけを一時的に対象にする場合：
+
+```sh
+ztodo issue owner/repository
+```
+
+Issueを選ぶと、Issue情報を含むAI向けプロンプトが表示され、クリップボードへコピーされます。
+
+### 3. AIへプロンプトを貼り付ける
+
+コピーされたプロンプトをCodexやChatGPTなどへ貼り付けます。
+
+プロンプトはAIに次の制約を伝えます。
+
+- 渡されたIssue情報だけを使用する
+- GitHub、Web、ローカルファイルを追加調査しない
+- コード変更やコマンド実行を行わない
+- ztodoが検証できるProposal JSONだけを返す
+
+AIが返したJSON全体をクリップボードへコピーします。説明文やMarkdownのコードフェンスは含めません。
+
+### 4. AIの回答を取り込む
 
 ```sh
 ztodo import
-ztodo prop
 ```
 
-取り込み時にJSON形式とProposalの各項目を検証し、Taskが空の場合は拒否します。既存の`proposal.json`は上書きしません。
+JSON形式、必須項目、文字数、重複、Task件数を検証し、成功した場合だけ`proposal.json`へAtomic保存します。Taskが空の場合や、既存Proposalがある場合は取り込みません。
 
-ztodo自身はOpenAI APIやGitHub APIを直接呼ばず、GitHubの認証と取得は`gh`へ任せます。macOSでは`pbcopy`と`pbpaste`、Linuxでは`wl-copy`・`wl-paste`または`xclip`を使用します。
-
-## Proposalを編集・承認する
-
-`proposal.json`が保存されている状態で実行します。
+### 5. Proposalを編集・承認する
 
 ```sh
 ztodo prop
@@ -120,7 +145,7 @@ ztodo prop
 
 ```text
 Issue #24: JSON保存処理を実装する
-Repository: owner/ztodo
+Repository: owner/repository
 
 1. 保存形式を定義する
 2. JSON読み込み処理を実装する
@@ -136,24 +161,117 @@ Commands:
 >
 ```
 
-対話中の番号は`1`から始まります。
+操作：
 
 - `a`：Task候補を追加
-- `e <n>`：タイトルを編集
-- `d <n>`：`y`の確認後に削除
-- `m <n>`：Task候補を指定位置へ移動
-- `s`：現在のProposalを再表示
+- `e <n>`：Task候補を編集
+- `d <n>`：確認後に削除
+- `m <n>`：指定位置へ移動
+- `s`：再表示
 - `q`：編集を終了して承認確認へ進む
 
-`q`の後にTask候補が表示され、`Approve? [y/N]`で小文字の`y`を入力するとTaskへ一括登録します。承認しなかった場合はProposalだけをAtomic保存し、後から再編集できます。入力が途中で終了した場合、編集内容は保存されません。
+`q`の後に次の確認が表示されます。
 
-Task候補は最大20件、タイトルは最大200文字です。空タイトル、重複、不正なUTF-8、改行などの制御文字は拒否されます。
+```text
+Approve? [y/N]
+```
 
-全Taskをメモリへ追加してから`tasks.json`を1回だけAtomic保存するため、一部だけが保存されることはありません。成功後は`proposal.json`を削除し、キャンセルやTask保存失敗時はProposalを残します。Task候補が空の場合は適用しません。
+- `y`：全Taskを一括登録し、Proposalを削除
+- それ以外：Taskへ登録せず、編集済みProposalを保存
 
-## データ保存
+入力が途中で終了した場合、編集内容は保存されません。
 
-保存先は次の優先順位で決まります。
+### 6. Taskを操作する
+
+```sh
+# 一覧
+ztodo ls
+
+# Taskを追加
+ztodo add READMEを更新する
+
+# 完了
+ztodo done 1
+
+# 削除
+ztodo del 1
+
+# 全Taskを削除してIDを1へ戻す
+ztodo clear
+```
+
+一覧表示：
+
+```text
+[ ] 1  JSON保存処理を実装する
+[x] 2  READMEを更新する
+```
+
+`del`と`clear`には確認がなく、元に戻せません。
+
+## コマンド一覧
+
+| コマンド | 動作 |
+| --- | --- |
+| `ztodo repo add <owner/repo>` | Repositoryを登録する |
+| `ztodo repo ls` | 登録済みRepositoryを表示する |
+| `ztodo repo del <owner/repo>` | Repositoryを削除する |
+| `ztodo issue [owner/repo]` | Issueを選び、AI向けプロンプトをコピーする |
+| `ztodo import` | クリップボードのProposal JSONを取り込む |
+| `ztodo prop` | Proposalを編集・承認してTaskへ登録する |
+| `ztodo add <title...>` | Taskを追加する |
+| `ztodo ls` | 全Taskを表示する |
+| `ztodo done <id>` | Taskを完了にする |
+| `ztodo del <id>` | Taskを確認なしで削除する |
+| `ztodo clear` | 全Taskを削除し、次のIDを`1`へ戻す |
+| `ztodo help` | ヘルプを表示する |
+| `ztodo version` | バージョンを表示する |
+
+## Zsh補完（任意）
+
+Zsh補完はztodo本体の実行には必要ありません。補完本体は`extras/zsh/`にあります。
+
+```sh
+source /path/to/ztodo/ztodo.plugin.zsh
+autoload -Uz compinit && compinit
+```
+
+```sh
+ztodo <Tab>       # コマンド候補
+ztodo repo <Tab>  # Repository管理コマンド
+ztodo done <Tab>  # Task IDとタイトル
+ztodo del <Tab>   # Task IDとタイトル
+```
+
+常に有効にする場合は、`source`を`~/.zshrc`へ追加します。`zsh-autocomplete`を導入している環境では、候補が入力中に自動表示されます。
+
+設定を反映し直す場合：
+
+```sh
+exec zsh
+```
+
+## エラー時の確認
+
+`GitHub CLI failed`と表示された場合：
+
+```sh
+gh auth status
+gh issue list --repo owner/repository
+```
+
+ztodoは`gh`が返した診断文も表示します。接続状態、認証、Repository名、アクセス権限を確認してください。
+
+Repository未登録の場合：
+
+```sh
+ztodo repo add owner/repository
+ztodo repo ls
+```
+
+## データと設定
+
+Taskデータの保存先：
 
 1. `ZTODO_DATA_FILE`
 2. `$XDG_DATA_HOME/ztodo/tasks.json`
@@ -161,78 +279,51 @@ Task候補は最大20件、タイトルは最大200文字です。空タイト�
 
 Proposalは`tasks.json`と同じディレクトリの`proposal.json`へ保存されます。
 
-```text
-~/.local/share/ztodo/
-├─ tasks.json
-└─ proposal.json
-```
+Repository設定の保存先：
 
-Taskデータ：
+1. `ZTODO_CONFIG_FILE`
+2. `$XDG_CONFIG_HOME/ztodo/config.json`
+3. `$HOME/.config/ztodo/config.json`
 
-```json
-{
-  "schema_version": 1,
-  "next_id": 2,
-  "tasks": [
-    {
-      "id": 1,
-      "title": "JSON保存処理を実装する",
-      "status": "todo"
-    }
-  ]
-}
-```
+TaskとProposalは一時ファイルへ完全に書き込んでから置き換えるAtomic保存を使用します。Proposalの承認では、全Taskをメモリへ追加してから`tasks.json`を一度だけ保存するため、一部だけが登録された状態を残しません。
 
-Proposalデータ：
+主な上限：
 
-```json
-{
-  "schema_version": 1,
-  "source": {
-    "provider": "github-cli",
-    "repository": "owner/repo",
-    "issue_number": 24,
-    "issue_title": "JSON保存処理を実装する"
-  },
-  "summary": "TaskをJSONへ保存できるようにする",
-  "completion_criteria": ["Taskを保存できる"],
-  "tasks": [{ "title": "JSON保存処理を実装する" }],
-  "excluded": [],
-  "notes": []
-}
-```
-
-どちらも一時ファイルへ完全に書き込んでから置き換えるAtomic保存を使用します。旧Taskデータの`created_at`は読み込み可能で、次回保存時に削除されます。
-
-Proposalは`schema_version: 1`を使用します。バージョンなしの既存データはv1として読み込み、未対応バージョンや未知の項目は拒否します。Source、概要、各リスト項目は空欄・制御文字を許可しません。`provider`は最大50文字、`repository`は`owner/name`形式で最大200文字、Issueタイトルは最大256文字、概要は最大2000文字です。Taskは最大20件（タイトル200文字）、各リストは最大20件（1項目500文字）です。
+- Repository：20件
+- ProposalのTask候補：20件
+- Taskタイトル：200文字
+- Issueタイトル：256文字
+- Proposal概要：2000文字
 
 ## 一時データで試す
 
 ```sh
 export ZTODO_DATA_FILE="$(mktemp -d)/tasks.json"
+export ZTODO_CONFIG_FILE="$(mktemp -d)/config.json"
 
+ztodo repo add owner/repository
 ztodo add 一時的なTask
 ztodo ls
 
 unset ZTODO_DATA_FILE
+unset ZTODO_CONFIG_FILE
 ```
-
-この場合、Proposalも同じ一時ディレクトリへ保存されます。
 
 ## 開発
 
 ```sh
-zig build run -- add テストTask
-zig build run -- ls
+zig build
+zig build test --summary all
+```
+
+開発時に直接実行する場合：
+
+```sh
+zig build run -- repo add owner/repository
 zig build run -- issue
 zig build run -- import
 zig build run -- prop
-```
-
-テスト：
-
-```sh
-zig build test --summary all
+zig build run -- ls
 ```
 
 テストでは通常のユーザーデータを使用しません。
@@ -240,4 +331,4 @@ zig build test --summary all
 ## 未実装
 
 - Taskの編集、タグ、優先度、期限
-- TUI、GUI、通知、クラウド同期
+- TUI、メニューバー、通知、クラウド同期
