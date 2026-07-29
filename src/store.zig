@@ -56,6 +56,25 @@ pub const Data = struct {
         return error.TaskNotFound;
     }
 
+    pub fn move(self: *Data, id: u64, position: usize) error{ TaskNotFound, InvalidTaskPosition }!bool {
+        if (position == 0 or position > self.tasks.items.len) return error.InvalidTaskPosition;
+
+        var source: ?usize = null;
+        for (self.tasks.items, 0..) |task, index| {
+            if (task.id == id) {
+                source = index;
+                break;
+            }
+        }
+        const source_index = source orelse return error.TaskNotFound;
+        const target_index = position - 1;
+        if (source_index == target_index) return false;
+
+        const moved = self.tasks.orderedRemove(source_index);
+        self.tasks.insertAssumeCapacity(target_index, moved);
+        return true;
+    }
+
     pub fn clear(self: *Data) usize {
         const count = self.tasks.items.len;
         for (self.tasks.items) |task| {
@@ -92,11 +111,6 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Data {
             .status = task.status,
         });
     }
-    std.mem.sort(Task, data.tasks.items, {}, struct {
-        fn lessThan(_: void, a: Task, b: Task) bool {
-            return a.id < b.id;
-        }
-    }.lessThan);
     return data;
 }
 
@@ -157,6 +171,22 @@ test "clear removes tasks and resets the next id" {
     try std.testing.expectEqual(@as(u64, 1), (try data.add("new")).id);
 }
 
+test "tasks can be moved by id to a one-based position" {
+    var data = Data.init(std.testing.allocator);
+    defer data.deinit();
+    _ = try data.add("first");
+    _ = try data.add("second");
+    _ = try data.add("third");
+
+    try std.testing.expect(try data.move(3, 1));
+    try std.testing.expectEqual(@as(u64, 3), data.tasks.items[0].id);
+    try std.testing.expectEqual(@as(u64, 1), data.tasks.items[1].id);
+    try std.testing.expect(!(try data.move(3, 1)));
+    try std.testing.expectError(error.InvalidTaskPosition, data.move(3, 0));
+    try std.testing.expectError(error.InvalidTaskPosition, data.move(3, 4));
+    try std.testing.expectError(error.TaskNotFound, data.move(99, 1));
+}
+
 test "JSON round trip supports unicode quotes statuses and next id" {
     var data = Data.init(std.testing.allocator);
     defer data.deinit();
@@ -171,6 +201,17 @@ test "JSON round trip supports unicode quotes statuses and next id" {
     try std.testing.expectEqualStrings("日本語と\"引用符\"", restored.tasks.items[0].title);
     try std.testing.expectEqual(Status.done, restored.tasks.items[0].status);
     try std.testing.expectEqual(Status.todo, restored.tasks.items[1].status);
+}
+
+test "JSON round trip preserves task order independently of ids" {
+    const json =
+        \\{"schema_version":1,"next_id":4,"tasks":[{"id":3,"title":"third","status":"todo"},{"id":1,"title":"first","status":"todo"},{"id":2,"title":"second","status":"done"}]}
+    ;
+    var data = try decode(std.testing.allocator, json);
+    defer data.deinit();
+    try std.testing.expectEqual(@as(u64, 3), data.tasks.items[0].id);
+    try std.testing.expectEqual(@as(u64, 1), data.tasks.items[1].id);
+    try std.testing.expectEqual(@as(u64, 2), data.tasks.items[2].id);
 }
 
 test "legacy JSON with created_at remains readable and is rewritten without it" {

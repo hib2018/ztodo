@@ -193,6 +193,9 @@ ztodo add READMEを更新する
 # 完了
 ztodo done 1
 
+# 並べ替え（Task 3を先頭へ）
+ztodo move 3 1
+
 # 削除
 ztodo del 1
 
@@ -209,6 +212,8 @@ ztodo clear
 
 `del`と`clear`には確認がなく、元に戻せません。
 
+`ztodo tui`では、`↑` / `↓`または`k` / `j`でTaskを選択し、`K` / `J`で選択中のTaskを上下へ移動できます。変更した順序はTUI終了時に保存されます。
+
 ## コマンド一覧
 
 | コマンド | 動作 |
@@ -222,6 +227,7 @@ ztodo clear
 | `ztodo add <title...>` | Taskを追加する |
 | `ztodo ls` | 全Taskを表示する |
 | `ztodo done <id>` | Taskを完了にする |
+| `ztodo move <id> <position>` | Taskを指定した表示位置へ移動する |
 | `ztodo del <id>` | Taskを確認なしで削除する |
 | `ztodo clear` | 全Taskを削除し、次のIDを`1`へ戻す |
 | `ztodo help` | ヘルプを表示する |

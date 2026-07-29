@@ -4,7 +4,7 @@ const store = @import("store.zig");
 pub const min_columns: u16 = 48;
 pub const min_rows: u16 = 12;
 
-pub const Key = enum { up, down, quit, other };
+pub const Key = enum { up, down, move_up, move_down, quit, other };
 
 pub const Model = struct {
     selected: usize = 0,
@@ -18,6 +18,7 @@ pub const Model = struct {
             .down => if (self.selected + 1 < task_count) {
                 self.selected += 1;
             },
+            .move_up, .move_down => {},
             .quit => self.quit = true,
             .other => {},
         }
@@ -29,6 +30,8 @@ pub fn decodeKey(first: u8, second: ?u8, third: ?u8) Key {
     if (first == 'q' or first == 3) return .quit;
     if (first == 'k') return .up;
     if (first == 'j') return .down;
+    if (first == 'K') return .move_up;
+    if (first == 'J') return .move_down;
     if (first == 0x1b and second == '[' and third == 'A') return .up;
     if (first == 0x1b and second == '[' and third == 'B') return .down;
     return .other;
@@ -66,10 +69,10 @@ pub fn render(writer: *std.Io.Writer, data: *const store.Data, model: Model, col
             });
         }
     }
-    try writer.writeAll("\r\n\x1b[2m ↑/k ↓/j move   q quit\x1b[0m\r\n");
+    try writer.writeAll("\r\n\x1b[2m ↑/k ↓/j select   K/J reorder   q quit\x1b[0m\r\n");
 }
 
-pub fn run(io: std.Io, data: *const store.Data) !void {
+pub fn run(io: std.Io, data: *store.Data) !bool {
     const stdin = std.Io.File.stdin();
     const stdout = std.Io.File.stdout();
     if (!try stdin.isTty(io) or !try stdout.isTty(io)) return error.NotATerminal;
@@ -95,11 +98,12 @@ pub fn run(io: std.Io, data: *const store.Data) !void {
     var in_buffer: [64]u8 = undefined;
     var input = stdin.readerStreaming(io, &in_buffer);
     var model: Model = .{};
+    var changed = false;
     while (!model.quit) {
         try render(&out.interface, data, model, 80, 24);
         try out.interface.flush();
         const first = input.interface.takeByte() catch |err| switch (err) {
-            error.EndOfStream => return,
+            error.EndOfStream => return changed,
             else => return err,
         };
         var second: ?u8 = null;
@@ -108,8 +112,24 @@ pub fn run(io: std.Io, data: *const store.Data) !void {
             second = input.interface.takeByte() catch null;
             if (second == '[') third = input.interface.takeByte() catch null;
         }
-        model.update(decodeKey(first, second, third), data.tasks.items.len);
+        const key = decodeKey(first, second, third);
+        switch (key) {
+            .move_up => if (model.selected > 0) {
+                const id = data.tasks.items[model.selected].id;
+                _ = try data.move(id, model.selected);
+                model.selected -= 1;
+                changed = true;
+            },
+            .move_down => if (model.selected + 1 < data.tasks.items.len) {
+                const id = data.tasks.items[model.selected].id;
+                _ = try data.move(id, model.selected + 2);
+                model.selected += 1;
+                changed = true;
+            },
+            else => model.update(key, data.tasks.items.len),
+        }
     }
+    return changed;
 }
 
 test "model selection stays within task bounds" {
@@ -126,6 +146,8 @@ test "model selection stays within task bounds" {
 test "key decoder supports arrows vim keys and interrupt" {
     try std.testing.expectEqual(Key.up, decodeKey(0x1b, '[', 'A'));
     try std.testing.expectEqual(Key.down, decodeKey('j', null, null));
+    try std.testing.expectEqual(Key.move_up, decodeKey('K', null, null));
+    try std.testing.expectEqual(Key.move_down, decodeKey('J', null, null));
     try std.testing.expectEqual(Key.quit, decodeKey(3, null, null));
 }
 

@@ -25,7 +25,9 @@ _ztodo() {
   commands=(
     'add:Add a task'
     'ls:List todo and done tasks'
+    'tui:Open the interactive task interface'
     'done:Mark a task as done'
+    'move:Move a task to a display position'
     'del:Delete a task without confirmation'
     'clear:Delete all tasks'
     'repo:Manage configured GitHub repositories'
@@ -51,6 +53,13 @@ _ztodo() {
           ;;
         done|del)
           _ztodo_task_ids
+          ;;
+        move)
+          if (( CURRENT == 3 )); then
+            _ztodo_task_ids
+          elif (( CURRENT == 4 )); then
+            _message 'destination position'
+          fi
           ;;
         issue)
           _message 'repository (owner/repo); omit to use all configured repositories'

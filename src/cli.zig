@@ -23,11 +23,17 @@ pub const Command = union(enum) {
     add: []const []const u8,
     done: u64,
     del: u64,
+    move: MoveCommand,
     clear,
     repo: RepoCommand,
     prop,
     proposal_import,
     issue: ?[]const u8,
+};
+
+pub const MoveCommand = struct {
+    id: u64,
+    position: usize,
 };
 
 pub const RepoCommand = union(enum) {
@@ -75,7 +81,18 @@ pub fn parse(args: []const []const u8) !Command {
     }
     if (std.mem.eql(u8, name, "done")) return .{ .done = try parseId(args) };
     if (std.mem.eql(u8, name, "del")) return .{ .del = try parseId(args) };
+    if (std.mem.eql(u8, name, "move")) return .{ .move = try parseMove(args) };
     return error.UnknownCommand;
+}
+
+fn parseMove(args: []const []const u8) !MoveCommand {
+    if (args.len < 4) return error.MissingArgument;
+    if (args.len > 4) return error.UnexpectedArgument;
+    const id = std.fmt.parseInt(u64, args[2], 10) catch return error.InvalidId;
+    if (id == 0) return error.InvalidId;
+    const position = std.fmt.parseInt(usize, args[3], 10) catch return error.InvalidPosition;
+    if (position == 0) return error.InvalidPosition;
+    return .{ .id = id, .position = position };
 }
 
 fn requireNoExtra(args: []const []const u8, command: Command) !Command {
@@ -146,10 +163,11 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
 
     switch (command) {
         .tui => {
-            tui.run(io, &data) catch |err| {
+            const changed = tui.run(io, &data) catch |err| {
                 writeRuntimeError(io, err, 0);
                 return 1;
             };
+            if (changed and !persist(allocator, io, path, &data)) return 1;
         },
         .ls => {
             if (data.tasks.items.len == 0) stdout.interface.writeAll("No tasks.\n") catch return 1 else for (data.tasks.items) |task| stdout.interface.print("[{s}] {d}  {s}\n", .{ if (task.status == .done) "x" else " ", task.id, task.title }) catch return 1;
@@ -183,6 +201,18 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
             defer allocator.free(deleted.title);
             if (!persist(allocator, io, path, &data)) return 1;
             stdout.interface.print("Deleted task {d}: {s}\n", .{ id, deleted.title }) catch return 1;
+        },
+        .move => |move_command| {
+            const changed = data.move(move_command.id, move_command.position) catch |err| {
+                writeRuntimeError(io, err, move_command.id);
+                return 1;
+            };
+            if (changed and !persist(allocator, io, path, &data)) return 1;
+            stdout.interface.print("Moved task {d} to position {d}: {s}\n", .{
+                move_command.id,
+                move_command.position,
+                data.tasks.items[move_command.position - 1].title,
+            }) catch return 1;
         },
         .clear => {
             const count = data.clear();
@@ -472,6 +502,7 @@ fn writeParseError(io: std.Io, err: anyerror) void {
         error.UnknownCommand => "unknown command.",
         error.MissingArgument => "missing required argument.",
         error.InvalidId => "id must be a positive integer.",
+        error.InvalidPosition => "position must be a positive integer.",
         error.UnexpectedArgument => "unexpected argument.",
         error.UnknownRepoCommand => "repo supports `ls`, `add`, and `del`.",
         else => "invalid input.",
@@ -569,6 +600,7 @@ fn writeRuntimeError(io: std.Io, err: anyerror, id: u64) void {
         error.WriteFailed => "could not write the data file.",
         error.CreateDirectoryFailed => "could not create the data directory.",
         error.NotATerminal => "tui requires both stdin and stdout to be terminals.",
+        error.InvalidTaskPosition => "position is outside the task list.",
         else => "operation failed.",
     };
     writeStderr(io, "Error: {s}\n", .{message});
@@ -619,9 +651,11 @@ pub const help_text =
     \\
     \\Commands:
     \\  add <title...>  Add a task; title arguments are joined with spaces
-    \\  ls              List todo and done tasks in ID order
+    \\  ls              List todo and done tasks in their current order
     \\  tui             Open the interactive task interface
     \\  done <id>       Mark a task as done
+    \\  move <id> <position>
+    \\                  Move a task to a one-based position
     \\  del <id>        Delete one task without confirmation
     \\  clear           Delete all tasks and reset the next ID to 1
     \\  repo ls         List configured GitHub repositories
@@ -639,6 +673,7 @@ pub const help_text =
     \\Examples:
     \\  ztodo add READMEを 更新する
     \\  ztodo done 1
+    \\  ztodo move 3 1
     \\  ztodo repo add owner/repo
     \\  ztodo issue
     \\  ztodo import
@@ -660,6 +695,12 @@ test "CLI argument parsing" {
     try std.testing.expectError(error.InvalidId, parse(&bad_done));
     const bad_del = [_][]const u8{ "ztodo", "del", "0" };
     try std.testing.expectError(error.InvalidId, parse(&bad_del));
+    const move = [_][]const u8{ "ztodo", "move", "3", "1" };
+    const move_command = (try parse(&move)).move;
+    try std.testing.expectEqual(@as(u64, 3), move_command.id);
+    try std.testing.expectEqual(@as(usize, 1), move_command.position);
+    const bad_move_position = [_][]const u8{ "ztodo", "move", "3", "0" };
+    try std.testing.expectError(error.InvalidPosition, parse(&bad_move_position));
     const ls = [_][]const u8{ "ztodo", "ls" };
     try std.testing.expect((try parse(&ls)) == .ls);
     const tui_command = [_][]const u8{ "ztodo", "tui" };
@@ -700,6 +741,30 @@ test "CLI argument parsing" {
     try std.testing.expectError(error.UnexpectedArgument, parse(&github_extra));
     try std.testing.expect(std.mem.indexOf(u8, help_text, "add <title...>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text, "clear runs without confirmation") != null);
+}
+
+test "help lists every top-level command" {
+    const command_names = [_][]const u8{
+        "add",
+        "ls",
+        "tui",
+        "done",
+        "move",
+        "del",
+        "clear",
+        "repo",
+        "issue",
+        "import",
+        "prop",
+        "help",
+        "version",
+    };
+
+    for (command_names) |name| {
+        var help_pattern_buffer: [32]u8 = undefined;
+        const help_pattern = try std.fmt.bufPrint(&help_pattern_buffer, "  {s}", .{name});
+        try std.testing.expect(std.mem.indexOf(u8, help_text, help_pattern) != null);
+    }
 }
 
 test "prop approval saves tasks and removes proposal" {
