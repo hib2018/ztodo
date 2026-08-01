@@ -1,5 +1,5 @@
 const std = @import("std");
-const github_cli = @import("github_cli.zig");
+const github_cli = @import("client.zig");
 
 pub const schema_version: u32 = 1;
 pub const max_repositories = 20;

@@ -1,5 +1,5 @@
 const std = @import("std");
-const proposal_mod = @import("proposal.zig");
+const proposal_mod = @import("model.zig");
 
 pub const Result = enum {
     save,

@@ -1,6 +1,6 @@
 const std = @import("std");
-const proposal_mod = @import("proposal.zig");
-const proposal_store = @import("proposal_store.zig");
+const proposal_mod = @import("model.zig");
+const proposal_store = @import("store.zig");
 
 pub fn import(
     allocator: std.mem.Allocator,

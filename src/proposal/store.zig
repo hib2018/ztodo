@@ -1,5 +1,5 @@
 const std = @import("std");
-const proposal_mod = @import("proposal.zig");
+const proposal_mod = @import("model.zig");
 
 pub const max_file_size = 1024 * 1024;
 

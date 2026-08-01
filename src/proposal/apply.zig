@@ -1,8 +1,8 @@
 const std = @import("std");
-const paths = @import("paths.zig");
-const proposal_mod = @import("proposal.zig");
-const proposal_store = @import("proposal_store.zig");
-const store = @import("store.zig");
+const paths = @import("../core/paths.zig");
+const proposal_mod = @import("model.zig");
+const proposal_store = @import("store.zig");
+const store = @import("../core/store.zig");
 
 pub fn applyProposal(
     allocator: std.mem.Allocator,

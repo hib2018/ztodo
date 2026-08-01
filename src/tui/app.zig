@@ -1,5 +1,5 @@
 const std = @import("std");
-const store = @import("store.zig");
+const store = @import("../core/store.zig");
 
 pub const min_columns: u16 = 48;
 pub const min_rows: u16 = 12;

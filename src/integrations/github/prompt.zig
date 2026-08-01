@@ -1,5 +1,5 @@
 const std = @import("std");
-const source_issue = @import("source_issue.zig");
+const source_issue = @import("issue.zig");
 
 pub fn build(allocator: std.mem.Allocator, issue: *const source_issue.Issue) ![]u8 {
     const repository_json = try std.json.Stringify.valueAlloc(allocator, issue.repository, .{});

@@ -1,17 +1,17 @@
 const std = @import("std");
-const store = @import("store.zig");
-const paths = @import("paths.zig");
-const proposal_mod = @import("proposal.zig");
-const proposal_store = @import("proposal_store.zig");
-const proposal_editor = @import("proposal_editor.zig");
-const workflow_apply = @import("workflow_apply.zig");
-const github_cli = @import("github_cli.zig");
-const github_config = @import("github_config.zig");
-const issue_selector = @import("issue_selector.zig");
-const ai_prompt = @import("ai_prompt.zig");
-const clipboard = @import("clipboard.zig");
-const workflow_clipboard_import = @import("workflow_clipboard_import.zig");
-const tui = @import("tui.zig");
+const store = @import("core/store.zig");
+const paths = @import("core/paths.zig");
+const proposal_mod = @import("proposal/model.zig");
+const proposal_store = @import("proposal/store.zig");
+const proposal_editor = @import("proposal/editor.zig");
+const workflow_apply = @import("proposal/apply.zig");
+const github_cli = @import("integrations/github/client.zig");
+const github_config = @import("integrations/github/config.zig");
+const issue_selector = @import("integrations/github/selector.zig");
+const ai_prompt = @import("integrations/github/prompt.zig");
+const clipboard = @import("platform/clipboard.zig");
+const workflow_clipboard_import = @import("proposal/clipboard_import.zig");
+const tui = @import("tui/app.zig");
 
 pub const version = "0.2.0";
 

@@ -1,5 +1,5 @@
 const std = @import("std");
-const source_issue = @import("source_issue.zig");
+const source_issue = @import("issue.zig");
 
 const max_output_bytes = 16 * 1024 * 1024;
 const max_issues = 10_000;

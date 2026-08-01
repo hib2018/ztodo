@@ -1,5 +1,5 @@
 const std = @import("std");
-const github_cli = @import("github_cli.zig");
+const github_cli = @import("client.zig");
 
 pub fn select(
     issues: []const github_cli.IssueSummary,
