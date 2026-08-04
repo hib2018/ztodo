@@ -49,6 +49,22 @@ pub const Data = struct {
         return true;
     }
 
+    pub fn toggle(self: *Data, id: u64) error{TaskNotFound}!Status {
+        const task = self.find(id) orelse return error.TaskNotFound;
+        task.status = if (task.status == .todo) .done else .todo;
+        return task.status;
+    }
+
+    pub fn edit(self: *Data, id: u64, title_input: []const u8) !bool {
+        const task = self.find(id) orelse return error.TaskNotFound;
+        const title = try task_mod.trimmedTitle(title_input);
+        if (std.mem.eql(u8, task.title, title)) return false;
+        const replacement = try self.allocator.dupe(u8, title);
+        self.allocator.free(task.title);
+        task.title = replacement;
+        return true;
+    }
+
     pub fn delete(self: *Data, id: u64) error{TaskNotFound}!Task {
         for (self.tasks.items, 0..) |task, index| {
             if (task.id == id) return self.tasks.orderedRemove(index);
@@ -157,6 +173,20 @@ test "task operations preserve monotonic ids and idempotent completion" {
     try std.testing.expect(!(try data.complete(3)));
     try std.testing.expectError(error.TaskNotFound, data.complete(99));
     try std.testing.expectError(error.TaskNotFound, data.delete(99));
+}
+
+test "tasks can be edited and toggled in both directions" {
+    var data = Data.init(std.testing.allocator);
+    defer data.deinit();
+    _ = try data.add("first");
+
+    try std.testing.expect(try data.edit(1, " updated "));
+    try std.testing.expectEqualStrings("updated", data.tasks.items[0].title);
+    try std.testing.expect(!(try data.edit(1, "updated")));
+    try std.testing.expectEqual(Status.done, try data.toggle(1));
+    try std.testing.expectEqual(Status.todo, try data.toggle(1));
+    try std.testing.expectError(error.TaskNotFound, data.edit(99, "missing"));
+    try std.testing.expectError(error.TaskNotFound, data.toggle(99));
 }
 
 test "clear removes tasks and resets the next id" {

@@ -25,7 +25,6 @@ _ztodo() {
   commands=(
     'add:Add a task'
     'ls:List todo and done tasks'
-    'tui:Open the interactive task interface'
     'done:Mark a task as done'
     'move:Move a task to a display position'
     'del:Delete a task without confirmation'

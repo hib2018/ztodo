@@ -7,6 +7,8 @@ const std = @import("std");
 // build runner to parallelize the build automatically (and the cache system to
 // know when a step doesn't need to be re-run).
 pub fn build(b: *std.Build) void {
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", manifestVersion(b));
     // Standard target options allow the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
@@ -40,6 +42,7 @@ pub fn build(b: *std.Build) void {
         // which requires us to specify a target.
         .target = target,
     });
+    mod.addOptions("build_options", build_options);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -153,4 +156,16 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+fn manifestVersion(b: *std.Build) []const u8 {
+    const Manifest = struct { version: []const u8 };
+    const path = b.pathFromRoot("build.zig.zon");
+    const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, path, b.allocator, .limited(1024 * 1024)) catch
+        @panic("could not read build.zig.zon");
+    const source = b.allocator.dupeZ(u8, bytes) catch @panic("out of memory");
+    const manifest = std.zon.parse.fromSliceAlloc(Manifest, b.allocator, source, null, .{
+        .ignore_unknown_fields = true,
+    }) catch @panic("could not parse version from build.zig.zon");
+    return manifest.version;
 }

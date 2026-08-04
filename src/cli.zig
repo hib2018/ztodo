@@ -12,8 +12,9 @@ const ai_prompt = @import("integrations/github/prompt.zig");
 const clipboard = @import("platform/clipboard.zig");
 const workflow_clipboard_import = @import("proposal/clipboard_import.zig");
 const tui = @import("tui/app.zig");
+const build_options = @import("build_options");
 
-pub const version = "0.2.0";
+pub const version = build_options.version;
 
 pub const Command = union(enum) {
     help,
@@ -43,12 +44,11 @@ pub const RepoCommand = union(enum) {
 };
 
 pub fn parse(args: []const []const u8) !Command {
-    if (args.len <= 1) return .help;
+    if (args.len <= 1) return .tui;
     const name = args[1];
     if (std.mem.eql(u8, name, "help")) return requireNoExtra(args, .help);
     if (std.mem.eql(u8, name, "version")) return requireNoExtra(args, .version);
     if (std.mem.eql(u8, name, "ls")) return requireNoExtra(args, .ls);
-    if (std.mem.eql(u8, name, "tui")) return requireNoExtra(args, .tui);
     if (std.mem.eql(u8, name, "clear")) return requireNoExtra(args, .clear);
     if (std.mem.eql(u8, name, "repo")) {
         if (args.len < 3) return error.MissingArgument;
@@ -163,11 +163,20 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
 
     switch (command) {
         .tui => {
-            const changed = tui.run(io, &data) catch |err| {
+            const proposal_path = paths.resolveProposal(allocator, environ) catch |err| {
                 writeRuntimeError(io, err, 0);
                 return 1;
             };
-            if (changed and !persist(allocator, io, path, &data)) return 1;
+            defer allocator.free(proposal_path);
+            const config_path = github_config.resolvePath(allocator, environ) catch |err| {
+                writeRuntimeError(io, err, 0);
+                return 1;
+            };
+            defer allocator.free(config_path);
+            tui.run(allocator, io, path, proposal_path, config_path, &data) catch |err| {
+                writeRuntimeError(io, err, 0);
+                return 1;
+            };
         },
         .ls => {
             if (data.tasks.items.len == 0) stdout.interface.writeAll("No tasks.\n") catch return 1 else for (data.tasks.items) |task| stdout.interface.print("[{s}] {d}  {s}\n", .{ if (task.status == .done) "x" else " ", task.id, task.title }) catch return 1;
@@ -647,12 +656,12 @@ pub const help_text =
     \\ztodo - execution-focused CLI task manager
     \\
     \\Usage:
+    \\  ztodo
     \\  ztodo <command> [arguments]
     \\
     \\Commands:
     \\  add <title...>  Add a task; title arguments are joined with spaces
     \\  ls              List todo and done tasks in their current order
-    \\  tui             Open the interactive task interface
     \\  done <id>       Mark a task as done
     \\  move <id> <position>
     \\                  Move a task to a one-based position
@@ -686,7 +695,7 @@ pub const help_text =
 
 test "CLI argument parsing" {
     const no_args = [_][]const u8{"ztodo"};
-    try std.testing.expect((try parse(&no_args)) == .help);
+    try std.testing.expect((try parse(&no_args)) == .tui);
     const unknown = [_][]const u8{ "ztodo", "wat" };
     try std.testing.expectError(error.UnknownCommand, parse(&unknown));
     const add = [_][]const u8{ "ztodo", "add" };
@@ -704,7 +713,7 @@ test "CLI argument parsing" {
     const ls = [_][]const u8{ "ztodo", "ls" };
     try std.testing.expect((try parse(&ls)) == .ls);
     const tui_command = [_][]const u8{ "ztodo", "tui" };
-    try std.testing.expect((try parse(&tui_command)) == .tui);
+    try std.testing.expectError(error.UnknownCommand, parse(&tui_command));
     const clear = [_][]const u8{ "ztodo", "clear" };
     try std.testing.expect((try parse(&clear)) == .clear);
     const clear_extra = [_][]const u8{ "ztodo", "clear", "now" };
@@ -747,7 +756,6 @@ test "help lists every top-level command" {
     const command_names = [_][]const u8{
         "add",
         "ls",
-        "tui",
         "done",
         "move",
         "del",

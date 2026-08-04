@@ -212,7 +212,13 @@ ztodo clear
 
 `del`と`clear`には確認がなく、元に戻せません。
 
-`ztodo tui`では、`↑` / `↓`または`k` / `j`でTaskを選択し、`K` / `J`で選択中のTaskを上下へ移動できます。変更した順序はTUI終了時に保存されます。
+`ztodo`では、`j` / `k`または`↓` / `↑`でTaskを選択します。`a`で追加、`e`で編集、`Space`で完了状態の切り替え、`d`で確認後に削除、`C`で確認後に全削除、`K` / `J`で並び替えができます。データ操作は成功するたびにAtomic保存されます。
+
+Tasks画面の`r`でRepositories画面を開きます。`a`で`owner/repository`形式のRepositoryを追加し、`d`で確認後に削除、`q`でTasks画面へ戻ります。
+
+Tasks画面の`g`で登録RepositoryのOpen Issueを取得します。Issues画面では`j` / `k`で選択し、`Enter`でIssue詳細を含むAI向けプロンプトをClipboardへコピーします。`q`でTasks画面へ戻ります。
+
+Tasks画面の`Tab`でProposal画面を開きます。Proposal画面では`i`でClipboardからProposalを取り込み、`a`でTask候補の追加、`e`で編集、`d`で確認後に削除、`K` / `J`で並び替え、`A`で確認後に承認できます。`q`でTasks画面へ戻ります。承認すると候補がTask一覧へ登録され、Proposalは削除されます。
 
 ## コマンド一覧
 
@@ -233,6 +239,8 @@ ztodo clear
 | `ztodo help` | ヘルプを表示する |
 | `ztodo version` | バージョンを表示する |
 
+バージョン番号は`build.zig.zon`の`.version`で一元管理されます。CLIの`ztodo version`とTUIヘルプは、ビルド時に同じ値を参照します。リリース時はSemantic Versioningに従ってこの値を更新し、同じ番号の`v`付きGitタグを作成します。
+
 ## Zsh補完（任意）
 
 Zsh補完はztodo本体の実行には必要ありません。補完本体は`extras/zsh/`にあります。
@@ -243,9 +251,11 @@ autoload -Uz compinit && compinit
 ```
 
 ```sh
-ztodo <Tab>       # コマンド候補
+ztodo             # TUIを起動
+ztodo <Tab>       # CLIサブコマンド候補
 ztodo repo <Tab>  # Repository管理コマンド
 ztodo done <Tab>  # Task IDとタイトル
+ztodo move <Tab>  # Task IDと移動先
 ztodo del <Tab>   # Task IDとタイトル
 ```
 
