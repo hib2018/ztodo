@@ -9,6 +9,8 @@ const github_cli = @import("integrations/github/client.zig");
 const github_config = @import("integrations/github/config.zig");
 const issue_selector = @import("integrations/github/selector.zig");
 const ai_prompt = @import("integrations/github/prompt.zig");
+const prompt_instructions = @import("integrations/github/prompt_instructions.zig");
+const source_issue = @import("integrations/github/issue.zig");
 const clipboard = @import("platform/clipboard.zig");
 const workflow_clipboard_import = @import("proposal/clipboard_import.zig");
 const tui = @import("tui/app.zig");
@@ -30,7 +32,10 @@ pub const Command = union(enum) {
     prop,
     proposal_import,
     issue: ?[]const u8,
+    prompt: PromptCommand,
 };
+
+pub const PromptCommand = enum { show, edit, reset, preview };
 
 pub const MoveCommand = struct {
     id: u64,
@@ -74,6 +79,16 @@ pub fn parse(args: []const []const u8) !Command {
     if (std.mem.eql(u8, name, "issue")) {
         if (args.len > 3) return error.UnexpectedArgument;
         return .{ .issue = if (args.len == 3) args[2] else null };
+    }
+    if (std.mem.eql(u8, name, "prompt")) {
+        if (args.len < 3) return error.MissingArgument;
+        if (args.len > 3) return error.UnexpectedArgument;
+        const action = args[2];
+        if (std.mem.eql(u8, action, "show")) return .{ .prompt = .show };
+        if (std.mem.eql(u8, action, "edit")) return .{ .prompt = .edit };
+        if (std.mem.eql(u8, action, "reset")) return .{ .prompt = .reset };
+        if (std.mem.eql(u8, action, "preview")) return .{ .prompt = .preview };
+        return error.UnknownPromptCommand;
     }
     if (std.mem.eql(u8, name, "add")) {
         if (args.len < 3) return error.MissingArgument;
@@ -147,6 +162,13 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
             repository,
             &stdout.interface,
         ),
+        .prompt => |prompt_command| return runPrompt(
+            allocator,
+            io,
+            environ,
+            prompt_command,
+            &stdout.interface,
+        ),
         else => {},
     }
 
@@ -173,7 +195,12 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
                 return 1;
             };
             defer allocator.free(config_path);
-            tui.run(allocator, io, path, proposal_path, config_path, &data) catch |err| {
+            const instructions_path = prompt_instructions.resolvePath(allocator, environ) catch |err| {
+                writeRuntimeError(io, err, 0);
+                return 1;
+            };
+            defer allocator.free(instructions_path);
+            tui.run(allocator, io, path, proposal_path, config_path, instructions_path, &data) catch |err| {
                 writeRuntimeError(io, err, 0);
                 return 1;
             };
@@ -395,7 +422,17 @@ fn runGithubIssue(
         return 1;
     };
     defer issue.deinit();
-    const prompt = ai_prompt.build(allocator, &issue) catch {
+    const instructions_path = prompt_instructions.resolvePath(allocator, environ) catch |err| {
+        writeGithubIssueError(io, err);
+        return 1;
+    };
+    defer allocator.free(instructions_path);
+    const instructions = prompt_instructions.load(allocator, io, instructions_path) catch |err| {
+        writeGithubIssueError(io, err);
+        return 1;
+    };
+    defer allocator.free(instructions);
+    const prompt = ai_prompt.buildWithInstructions(allocator, &issue, instructions) catch {
         writeGithubIssueError(io, error.PromptGenerationFailed);
         return 1;
     };
@@ -409,6 +446,144 @@ fn runGithubIssue(
     };
     stdout.writeAll("\nPrompt copied to clipboard.\n") catch return 1;
     return 0;
+}
+
+fn runPrompt(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    command: PromptCommand,
+    stdout: *std.Io.Writer,
+) u8 {
+    const path = prompt_instructions.resolvePath(allocator, environ) catch |err| {
+        writePromptError(io, err);
+        return 1;
+    };
+    defer allocator.free(path);
+
+    switch (command) {
+        .show => {
+            const instructions = prompt_instructions.load(allocator, io, path) catch |err| {
+                writePromptError(io, err);
+                return 1;
+            };
+            defer allocator.free(instructions);
+            if (instructions.len == 0)
+                stdout.writeAll("No custom prompt instructions.\n") catch return 1
+            else {
+                stdout.writeAll(instructions) catch return 1;
+                if (instructions[instructions.len - 1] != '\n') stdout.writeByte('\n') catch return 1;
+            }
+            stdout.print("Instructions: {s}\n", .{path}) catch return 1;
+        },
+        .preview => {
+            const instructions = prompt_instructions.load(allocator, io, path) catch |err| {
+                writePromptError(io, err);
+                return 1;
+            };
+            defer allocator.free(instructions);
+            var issue = source_issue.init(
+                allocator,
+                "github-cli",
+                "owner/repository",
+                123,
+                "Sample Issue title",
+                "Sample Issue body",
+            ) catch {
+                writePromptError(io, error.PromptGenerationFailed);
+                return 1;
+            };
+            defer issue.deinit();
+            const preview = ai_prompt.buildWithInstructions(allocator, &issue, instructions) catch {
+                writePromptError(io, error.PromptGenerationFailed);
+                return 1;
+            };
+            defer allocator.free(preview);
+            stdout.print("Prompt preview (using sample Issue data):\n\n{s}", .{preview}) catch return 1;
+        },
+        .edit => {
+            editPromptInstructions(allocator, io, environ, path) catch |err| {
+                writePromptError(io, err);
+                return 1;
+            };
+            stdout.print("Saved prompt instructions: {s}\n", .{path}) catch return 1;
+        },
+        .reset => {
+            var stdin_buffer: [128]u8 = undefined;
+            var stdin = std.Io.File.stdin().reader(io, &stdin_buffer);
+            stdout.print("Delete custom prompt instructions at {s}? [y/N] ", .{path}) catch return 1;
+            stdout.flush() catch return 1;
+            const answer = stdin.interface.takeDelimiter('\n') catch {
+                writePromptError(io, error.PromptInstructionsReadFailed);
+                return 1;
+            } orelse {
+                stdout.writeAll("\nCancelled.\n") catch return 1;
+                return 0;
+            };
+            if (!std.mem.eql(u8, std.mem.trim(u8, answer, " \t\r"), "y")) {
+                stdout.writeAll("Cancelled.\n") catch return 1;
+                return 0;
+            }
+            const removed = prompt_instructions.remove(io, path) catch |err| {
+                writePromptError(io, err);
+                return 1;
+            };
+            stdout.writeAll(if (removed) "Prompt instructions reset.\n" else "No custom prompt instructions.\n") catch return 1;
+        },
+    }
+    return 0;
+}
+
+fn editPromptInstructions(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    path: []const u8,
+) !void {
+    const editor = environ.get("VISUAL") orelse environ.get("EDITOR") orelse return error.EditorNotConfigured;
+    if (std.mem.trim(u8, editor, " \t\r\n").len == 0) return error.EditorNotConfigured;
+    const current = try prompt_instructions.load(allocator, io, path);
+    defer allocator.free(current);
+    if (std.fs.path.dirname(path)) |parent| {
+        std.Io.Dir.cwd().createDirPath(io, parent) catch return error.CreatePromptInstructionsDirectoryFailed;
+    }
+
+    var suffix: u64 = undefined;
+    io.random(std.mem.asBytes(&suffix));
+    const temporary_path = try std.fmt.allocPrint(allocator, "{s}.edit-{x}", .{ path, suffix });
+    defer allocator.free(temporary_path);
+    defer std.Io.Dir.cwd().deleteFile(io, temporary_path) catch {};
+    {
+        const file = std.Io.Dir.cwd().createFile(io, temporary_path, .{ .exclusive = true }) catch
+            return error.PromptInstructionsWriteFailed;
+        defer file.close(io);
+        std.Io.File.writeStreamingAll(file, io, current) catch return error.PromptInstructionsWriteFailed;
+        file.sync(io) catch return error.PromptInstructionsWriteFailed;
+    }
+
+    const term = blk: {
+        var child = std.process.spawn(io, .{
+            .argv = &.{ "/bin/sh", "-c", "file=$2; eval 'set -- ' \"$1\"; exec \"$@\" \"$file\"", "ztodo-editor", editor, temporary_path },
+            .stdin = .inherit,
+            .stdout = .inherit,
+            .stderr = .inherit,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return error.EditorNotFound,
+            else => return error.EditorFailed,
+        };
+        errdefer child.kill(io);
+        break :blk child.wait(io) catch return error.EditorFailed;
+    };
+    switch (term) {
+        .exited => |code| if (code != 0) return error.EditorFailed,
+        else => return error.EditorFailed,
+    }
+    const edited = std.Io.Dir.cwd().readFileAlloc(io, temporary_path, allocator, .limited(prompt_instructions.max_file_size)) catch |err| switch (err) {
+        error.StreamTooLong => return error.PromptInstructionsTooLarge,
+        else => return error.PromptInstructionsReadFailed,
+    };
+    defer allocator.free(edited);
+    try prompt_instructions.save(io, path, edited);
 }
 
 fn runProp(
@@ -514,6 +689,7 @@ fn writeParseError(io: std.Io, err: anyerror) void {
         error.InvalidPosition => "position must be a positive integer.",
         error.UnexpectedArgument => "unexpected argument.",
         error.UnknownRepoCommand => "repo supports `ls`, `add`, and `del`.",
+        error.UnknownPromptCommand => "prompt supports `show`, `edit`, `reset`, and `preview`.",
         else => "invalid input.",
     };
     writeStderr(io, "Error: {s}\n\nUsage: ztodo <command> [arguments]\n", .{message});
@@ -593,7 +769,28 @@ fn writeGithubIssueError(io: std.Io, err: anyerror) void {
         error.UnsupportedClipboard => "clipboard copy is not supported on this OS.",
         error.ClipboardFailed => "could not copy the prompt to the clipboard.",
         error.PromptGenerationFailed => "could not generate the AI prompt.",
+        error.PromptInstructionsTooLarge => "prompt instructions exceed 64 KiB.",
+        error.PromptInstructionsReadFailed => "prompt instructions could not be read.",
+        error.InvalidPromptInstructions => "prompt instructions must be valid UTF-8 without control characters.",
         else => "GitHub issue operation failed.",
+    };
+    writeStderr(io, "Error: {s}\n", .{message});
+}
+
+fn writePromptError(io: std.Io, err: anyerror) void {
+    const message = switch (err) {
+        error.MissingHome => "HOME is not set and no prompt instructions override is available.",
+        error.PromptInstructionsTooLarge => "prompt instructions exceed 64 KiB.",
+        error.PromptInstructionsReadFailed => "prompt instructions could not be read.",
+        error.InvalidPromptInstructions => "prompt instructions must be valid UTF-8 without control characters.",
+        error.CreatePromptInstructionsDirectoryFailed => "prompt instructions directory could not be created.",
+        error.PromptInstructionsWriteFailed => "prompt instructions could not be saved; the existing file was kept.",
+        error.PromptInstructionsDeleteFailed => "prompt instructions could not be deleted.",
+        error.EditorNotConfigured => "set VISUAL or EDITOR before running `ztodo prompt edit`.",
+        error.EditorNotFound => "the configured editor could not be found.",
+        error.EditorFailed => "the configured editor failed; existing prompt instructions were kept.",
+        error.PromptGenerationFailed => "could not generate the prompt preview.",
+        else => "prompt instruction operation failed.",
     };
     writeStderr(io, "Error: {s}\n", .{message});
 }
@@ -610,6 +807,9 @@ fn writeRuntimeError(io: std.Io, err: anyerror, id: u64) void {
         error.CreateDirectoryFailed => "could not create the data directory.",
         error.NotATerminal => "tui requires both stdin and stdout to be terminals.",
         error.InvalidTaskPosition => "position is outside the task list.",
+        error.PromptInstructionsTooLarge => "prompt instructions exceed 64 KiB.",
+        error.PromptInstructionsReadFailed => "prompt instructions could not be read.",
+        error.InvalidPromptInstructions => "prompt instructions must be valid UTF-8 without control characters.",
         else => "operation failed.",
     };
     writeStderr(io, "Error: {s}\n", .{message});
@@ -676,6 +876,10 @@ pub const help_text =
     \\  prop            Review, edit, and approve the current Proposal
     \\  issue [owner/repo]
     \\                  Select an Issue and copy an AI prompt; defaults to all configured repositories
+    \\  prompt show     Show custom AI prompt instructions
+    \\  prompt edit     Edit custom instructions with VISUAL or EDITOR
+    \\  prompt preview  Preview the complete prompt with sample Issue data
+    \\  prompt reset    Delete custom instructions after confirmation
     \\  help            Show this help
     \\  version         Show version
     \\
@@ -685,6 +889,7 @@ pub const help_text =
     \\  ztodo move 3 1
     \\  ztodo repo add owner/repo
     \\  ztodo issue
+    \\  ztodo prompt edit
     \\  ztodo import
     \\  ztodo prop
     \\
@@ -748,6 +953,16 @@ test "CLI argument parsing" {
     try std.testing.expectEqualStrings("owner/repo", github_command.issue.?);
     const github_extra = [_][]const u8{ "ztodo", "issue", "owner/repo", "extra" };
     try std.testing.expectError(error.UnexpectedArgument, parse(&github_extra));
+    const prompt_show = [_][]const u8{ "ztodo", "prompt", "show" };
+    try std.testing.expect((try parse(&prompt_show)).prompt == .show);
+    const prompt_edit = [_][]const u8{ "ztodo", "prompt", "edit" };
+    try std.testing.expect((try parse(&prompt_edit)).prompt == .edit);
+    const prompt_reset = [_][]const u8{ "ztodo", "prompt", "reset" };
+    try std.testing.expect((try parse(&prompt_reset)).prompt == .reset);
+    const prompt_preview = [_][]const u8{ "ztodo", "prompt", "preview" };
+    try std.testing.expect((try parse(&prompt_preview)).prompt == .preview);
+    const prompt_unknown = [_][]const u8{ "ztodo", "prompt", "wat" };
+    try std.testing.expectError(error.UnknownPromptCommand, parse(&prompt_unknown));
     try std.testing.expect(std.mem.indexOf(u8, help_text, "add <title...>") != null);
     try std.testing.expect(std.mem.indexOf(u8, help_text, "clear runs without confirmation") != null);
 }
@@ -764,6 +979,7 @@ test "help lists every top-level command" {
         "issue",
         "import",
         "prop",
+        "prompt",
         "help",
         "version",
     };

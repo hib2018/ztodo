@@ -10,6 +10,7 @@ pub const github_cli = @import("integrations/github/client.zig");
 pub const github_config = @import("integrations/github/config.zig");
 pub const issue_selector = @import("integrations/github/selector.zig");
 pub const ai_prompt = @import("integrations/github/prompt.zig");
+pub const prompt_instructions = @import("integrations/github/prompt_instructions.zig");
 pub const clipboard = @import("platform/clipboard.zig");
 pub const workflow_clipboard_import = @import("proposal/clipboard_import.zig");
 pub const tui = @import("tui/app.zig");
@@ -28,6 +29,7 @@ test {
     _ = github_config;
     _ = issue_selector;
     _ = ai_prompt;
+    _ = prompt_instructions;
     _ = clipboard;
     _ = workflow_clipboard_import;
     _ = tui;

@@ -9,6 +9,7 @@ const clipboard = @import("../platform/clipboard.zig");
 const github_config = @import("../integrations/github/config.zig");
 const github_client = @import("../integrations/github/client.zig");
 const github_prompt = @import("../integrations/github/prompt.zig");
+const prompt_instructions = @import("../integrations/github/prompt_instructions.zig");
 const build_options = @import("build_options");
 
 pub const min_columns: u16 = 48;
@@ -676,7 +677,7 @@ fn popupText(writer: *std.Io.Writer, row: u16, column: u16, content: []const u8,
     });
 }
 
-pub fn run(allocator: std.mem.Allocator, io: std.Io, path: []const u8, proposal_path: []const u8, config_path: []const u8, data: *store.Data) !void {
+pub fn run(allocator: std.mem.Allocator, io: std.Io, path: []const u8, proposal_path: []const u8, config_path: []const u8, instructions_path: []const u8, data: *store.Data) !void {
     const stdin = std.Io.File.stdin();
     const stdout = std.Io.File.stdout();
     if (!try stdin.isTty(io) or !try stdout.isTty(io)) return error.NotATerminal;
@@ -713,6 +714,8 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, path: []const u8, proposal_
         else => return err,
     };
     defer if (config) |*value| value.deinit();
+    const instructions = try prompt_instructions.load(allocator, io, instructions_path);
+    defer allocator.free(instructions);
     var issues: ?github_client.IssueList = null;
     defer if (issues) |*value| value.deinit();
     while (!model.quit) {
@@ -752,7 +755,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, path: []const u8, proposal_
             continue;
         }
         if (model.screen == .issues) {
-            try handleIssueKey(allocator, io, &issues, &model, key);
+            try handleIssueKey(allocator, io, instructions, &issues, &model, key);
             continue;
         }
         switch (key) {
@@ -923,6 +926,7 @@ fn openIssues(
 fn handleIssueKey(
     allocator: std.mem.Allocator,
     io: std.Io,
+    instructions: []const u8,
     issues: *?github_client.IssueList,
     model: *Model,
     key: Key,
@@ -942,7 +946,7 @@ fn handleIssueKey(
                 return;
             };
             defer issue.deinit();
-            const prompt = github_prompt.build(allocator, &issue) catch {
+            const prompt = github_prompt.buildWithInstructions(allocator, &issue, instructions) catch {
                 model.popup = .{ .error_message = " AI向けプロンプトを生成できませんでした。" };
                 return;
             };
@@ -1598,11 +1602,11 @@ test "issue screen uses j k selection and q returns to tasks" {
     };
     var list: ?github_client.IssueList = .{ .allocator = std.testing.allocator, .items = &items };
     var model: Model = .{ .screen = .issues };
-    try handleIssueKey(std.testing.allocator, std.testing.io, &list, &model, .down);
+    try handleIssueKey(std.testing.allocator, std.testing.io, "", &list, &model, .down);
     try std.testing.expectEqual(@as(usize, 1), model.issue_selected);
-    try handleIssueKey(std.testing.allocator, std.testing.io, &list, &model, .up);
+    try handleIssueKey(std.testing.allocator, std.testing.io, "", &list, &model, .up);
     try std.testing.expectEqual(@as(usize, 0), model.issue_selected);
-    try handleIssueKey(std.testing.allocator, std.testing.io, &list, &model, .quit);
+    try handleIssueKey(std.testing.allocator, std.testing.io, "", &list, &model, .quit);
     try std.testing.expectEqual(Screen.tasks, model.screen);
     try std.testing.expect(!model.quit);
 }

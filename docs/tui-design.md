@@ -147,7 +147,7 @@ Tasks画面の`g`で開く。登録RepositoryのOpen Issueを一覧表示する�
 | キー | 操作 |
 | --- | --- |
 | `j` / `k`、`↓` / `↑` | Issueを選択する |
-| `Enter` | Issue詳細からAI向けプロンプトを生成してClipboardへコピーする |
+| `Enter` | Issue詳細と保存済みのユーザー追加指示からAI向けプロンプトを生成してClipboardへコピーする |
 | `q` | Tasks画面へ戻る |
 
 ## Popup

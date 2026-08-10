@@ -33,6 +33,7 @@ _ztodo() {
     'issue:Select a GitHub Issue and copy an AI prompt'
     'import:Import Proposal JSON from the clipboard'
     'prop:Review, edit, and approve the current Proposal'
+    'prompt:Manage custom AI prompt instructions'
     'help:Show help'
     'version:Show version'
   )
@@ -77,6 +78,17 @@ _ztodo() {
                 _message 'repository (owner/repo)'
                 ;;
             esac
+          fi
+          ;;
+        prompt)
+          if (( CURRENT == 3 )); then
+            local -a prompt_commands=(
+              'show:Show custom instructions'
+              'edit:Edit custom instructions'
+              'preview:Preview the complete prompt'
+              'reset:Delete custom instructions'
+            )
+            _describe -t prompt-commands 'prompt command' prompt_commands
           fi
           ;;
       esac
