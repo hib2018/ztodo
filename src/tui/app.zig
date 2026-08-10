@@ -10,6 +10,7 @@ const github_config = @import("../integrations/github/config.zig");
 const github_client = @import("../integrations/github/client.zig");
 const github_prompt = @import("../integrations/github/prompt.zig");
 const prompt_instructions = @import("../integrations/github/prompt_instructions.zig");
+const prompt_editor = @import("../integrations/github/prompt_editor.zig");
 const build_options = @import("build_options");
 
 pub const min_columns: u16 = 48;
@@ -17,7 +18,6 @@ pub const min_rows: u16 = 12;
 
 const panel_style = "\x1b[39m\x1b[49m";
 const panel_heading_style = "\x1b[1;39m\x1b[49m";
-const border_style = "\x1b[39m\x1b[48;2;229;221;176m";
 const shadow_style = "\x1b[2;39m";
 
 const Size = struct {
@@ -74,7 +74,67 @@ const Confirmation = union(enum) {
     delete_repository: usize,
 };
 
-const Screen = enum { tasks, proposal, repositories, issues };
+const Screen = enum { tasks, proposal, repositories, issues, prompt, help };
+const Focus = enum { sidebar, content };
+const SidebarItem = enum { tasks, repositories, prompt, help };
+const sidebar_width: u16 = 22;
+
+const RepositoryNode = struct {
+    repository: []u8,
+    expanded: bool = false,
+    issues: ?github_client.IssueList = null,
+
+    fn deinit(self: *RepositoryNode, allocator: std.mem.Allocator) void {
+        allocator.free(self.repository);
+        if (self.issues) |*issues| issues.deinit();
+        self.* = undefined;
+    }
+};
+
+const RepositoryTree = struct {
+    allocator: std.mem.Allocator,
+    nodes: std.ArrayList(RepositoryNode) = .empty,
+
+    fn init(allocator: std.mem.Allocator) RepositoryTree {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *RepositoryTree) void {
+        for (self.nodes.items) |*node| node.deinit(self.allocator);
+        self.nodes.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn find(self: *RepositoryTree, repository: []const u8) ?*RepositoryNode {
+        for (self.nodes.items) |*node| {
+            if (std.mem.eql(u8, node.repository, repository)) return node;
+        }
+        return null;
+    }
+
+    fn getOrCreate(self: *RepositoryTree, repository: []const u8) !*RepositoryNode {
+        if (self.find(repository)) |node| return node;
+        const copy = try self.allocator.dupe(u8, repository);
+        errdefer self.allocator.free(copy);
+        try self.nodes.append(self.allocator, .{ .repository = copy });
+        return &self.nodes.items[self.nodes.items.len - 1];
+    }
+
+    fn issueCount(self: *const RepositoryTree, repository: []const u8) usize {
+        for (self.nodes.items) |node| {
+            if (std.mem.eql(u8, node.repository, repository))
+                return if (node.expanded and node.issues != null) node.issues.?.items.len else 0;
+        }
+        return 0;
+    }
+
+    fn isExpanded(self: *const RepositoryTree, repository: []const u8) bool {
+        for (self.nodes.items) |node| {
+            if (std.mem.eql(u8, node.repository, repository)) return node.expanded;
+        }
+        return false;
+    }
+};
 
 pub const Key = enum {
     up,
@@ -93,6 +153,8 @@ pub const Key = enum {
     import_proposal,
     open_repositories,
     open_issues,
+    open_proposal,
+    focus_sidebar,
     help,
     accept,
     backspace,
@@ -114,9 +176,12 @@ pub const Popup = union(enum) {
 
 pub const Model = struct {
     screen: Screen = .tasks,
+    focus: Focus = .content,
+    sidebar_selected: SidebarItem = .tasks,
     selected: usize = 0,
     proposal_selected: usize = 0,
     repository_selected: usize = 0,
+    repository_issue_selected: ?usize = null,
     issue_selected: usize = 0,
     quit: bool = false,
     popup: ?Popup = null,
@@ -129,7 +194,7 @@ pub const Model = struct {
             .down, .scroll_next => if (self.selected + 1 < task_count) {
                 self.selected += 1;
             },
-            .move_up, .move_down, .add, .edit, .toggle, .delete, .clear, .switch_screen, .approve, .import_proposal, .open_repositories, .open_issues, .help, .accept, .backspace => {},
+            .move_up, .move_down, .add, .edit, .toggle, .delete, .clear, .switch_screen, .approve, .import_proposal, .open_repositories, .open_issues, .open_proposal, .focus_sidebar, .help, .accept, .backspace => {},
             .quit => self.quit = true,
             .other => {},
         }
@@ -165,10 +230,10 @@ pub fn render(writer: *std.Io.Writer, data: *const store.Data, model: Model, col
 }
 
 fn renderApp(writer: *std.Io.Writer, data: *const store.Data, proposal: ?*const proposal_mod.Proposal, model: Model, columns: u16, rows: u16) !void {
-    return renderApplication(writer, data, proposal, null, null, model, columns, rows);
+    return renderApplication(writer, data, proposal, null, null, null, "", model, columns, rows);
 }
 
-fn renderApplication(writer: *std.Io.Writer, data: *const store.Data, proposal: ?*const proposal_mod.Proposal, config: ?*const github_config.Config, issues: ?*const github_client.IssueList, model: Model, columns: u16, rows: u16) !void {
+fn renderApplication(writer: *std.Io.Writer, data: *const store.Data, proposal: ?*const proposal_mod.Proposal, config: ?*const github_config.Config, issues: ?*const github_client.IssueList, repository_tree: ?*const RepositoryTree, instructions: []const u8, model: Model, columns: u16, rows: u16) !void {
     try writer.writeAll("\x1b[2J\x1b[H");
     if (columns < min_columns or rows < min_rows) {
         try writer.print("ztodo: terminal too small ({d}x{d}); need at least {d}x{d}.\r\n", .{
@@ -177,11 +242,17 @@ fn renderApplication(writer: *std.Io.Writer, data: *const store.Data, proposal: 
         return;
     }
 
+    const sidebar: Panel = .{ .top = 1, .left = 1, .width = sidebar_width, .height = rows };
+    const detail: Panel = .{ .top = 1, .left = sidebar_width, .width = columns - sidebar_width + 1, .height = rows };
+    const dimmed = model.popup != null;
+    try renderSidebar(writer, sidebar, model, dimmed);
     switch (model.screen) {
-        .tasks => try renderBase(writer, data, model, columns, rows, model.popup != null),
-        .proposal => try renderProposalBase(writer, proposal, model, columns, rows, model.popup != null),
-        .repositories => try renderRepositoriesBase(writer, config, model, columns, rows, model.popup != null),
-        .issues => try renderIssuesBase(writer, issues, model, columns, rows, model.popup != null),
+        .tasks => try renderBase(writer, data, model, detail, dimmed),
+        .proposal => try renderProposalBase(writer, proposal, model, detail, dimmed),
+        .repositories => try renderRepositoriesBase(writer, config, repository_tree, model, detail, dimmed),
+        .issues => try renderIssuesBase(writer, issues, model, detail, dimmed),
+        .prompt => try renderPromptBase(writer, instructions, detail, dimmed),
+        .help => try renderHelpBase(writer, detail, dimmed),
     }
     if (model.popup) |popup|
         try renderPopup(writer, popup, model.screen, columns, rows)
@@ -189,12 +260,38 @@ fn renderApplication(writer: *std.Io.Writer, data: *const store.Data, proposal: 
         try writer.writeAll("\x1b[?25l");
 }
 
-fn renderBase(writer: *std.Io.Writer, data: *const store.Data, model: Model, columns: u16, rows: u16, dimmed: bool) !void {
-    const style = if (dimmed) "\x1b[2m" else "";
-    const panel = Panel.init(columns, rows, 0);
+fn renderSidebar(writer: *std.Io.Writer, panel: Panel, model: Model, dimmed: bool) !void {
     try renderPanel(writer, panel, dimmed, false);
-    try popupText(writer, panel.top + 1, panel.left, " ztodo  Tasks", true, dimmed);
-    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", borderStyle(dimmed));
+    var heading_buffer: [64]u8 = undefined;
+    const heading = try std.fmt.bufPrint(&heading_buffer, " ztodo v{s}", .{build_options.version});
+    try popupText(writer, panel.top + 1, panel.left, heading, true, dimmed);
+    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", panelStyle(dimmed));
+    const items = [_]struct { item: SidebarItem, label: []const u8 }{
+        .{ .item = .tasks, .label = "タスク一覧" },
+        .{ .item = .repositories, .label = "リポジトリ一覧" },
+        .{ .item = .prompt, .label = "プロンプト編集" },
+        .{ .item = .help, .label = "ヘルプ" },
+    };
+    for (items, 0..) |entry, index| {
+        const selected = entry.item == model.sidebar_selected;
+        const focused = selected and model.focus == .sidebar and !dimmed;
+        var line_buffer: [64]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buffer, "{s} {s}", .{ if (selected) ">" else " ", entry.label });
+        try writer.print("\x1b[{d};{d}H{s}{s}{s}", .{ panel.top + 4 + @as(u16, @intCast(index)), panel.left + 1, panelStyle(dimmed), if (focused) "\x1b[7m" else "", line });
+        if (focused) {
+            var padding = (panel.width -| 2) -| displayWidth(line);
+            while (padding > 0) : (padding -= 1) try writer.writeByte(' ');
+        }
+        try writer.writeAll("\x1b[0m");
+    }
+    try popupTextClipped(writer, panel, panel.bottom() - 1, " Tab  詳細へ", false, dimmed);
+}
+
+fn renderBase(writer: *std.Io.Writer, data: *const store.Data, model: Model, panel: Panel, dimmed: bool) !void {
+    const style = if (dimmed) "\x1b[2m" else "";
+    try renderPanel(writer, panel, dimmed, false);
+    try popupText(writer, panel.top + 1, panel.left, " タスク一覧", true, dimmed);
+    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", panelStyle(dimmed));
 
     const task_row = panel.top + 3;
     const available_rows: usize = panel.height -| 5;
@@ -212,7 +309,7 @@ fn renderBase(writer: *std.Io.Writer, data: *const store.Data, model: Model, col
             row += @intCast(try renderTask(
                 writer,
                 task,
-                index == model.selected,
+                index == model.selected and model.focus == .content,
                 style,
                 row,
                 panel.left + 1,
@@ -222,14 +319,13 @@ fn renderBase(writer: *std.Io.Writer, data: *const store.Data, model: Model, col
             ));
         }
     }
-    try popupText(writer, panel.bottom() - 1, panel.left, " j/k or ↑/↓ select  a add  e edit  Space done  d delete  K/J move  Tab Proposal  r repos  g issues  ? help  q quit", false, dimmed);
+    try popupTextClipped(writer, panel, panel.bottom() - 1, " j/k 選択  a 追加  e 編集  Space 完了  d 削除  K/J 移動  p Proposal  g Issue  Tab メニュー", false, dimmed);
 }
 
-fn renderProposalBase(writer: *std.Io.Writer, proposal: ?*const proposal_mod.Proposal, model: Model, columns: u16, rows: u16, dimmed: bool) !void {
-    const panel = Panel.init(columns, rows, 0);
+fn renderProposalBase(writer: *std.Io.Writer, proposal: ?*const proposal_mod.Proposal, model: Model, panel: Panel, dimmed: bool) !void {
     try renderPanel(writer, panel, dimmed, false);
     try popupText(writer, panel.top + 1, panel.left, " ztodo  Proposal", true, dimmed);
-    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", borderStyle(dimmed));
+    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", panelStyle(dimmed));
     const current = proposal orelse {
         try popupText(writer, panel.top + 4, panel.left, " Proposalはありません。iでClipboardから取り込めます。", false, dimmed);
         try popupText(writer, panel.bottom() - 1, panel.left, " i import  q return  ? help", false, dimmed);
@@ -243,10 +339,11 @@ fn renderProposalBase(writer: *std.Io.Writer, proposal: ?*const proposal_mod.Pro
     for (current.tasks.items, 0..) |candidate, index| {
         if (row >= panel.bottom() - 1) break;
         var prefix_buffer: [32]u8 = undefined;
-        const prefix = try std.fmt.bufPrint(&prefix_buffer, "{s} {d: >2}. ", .{ if (index == model.proposal_selected) ">" else " ", index + 1 });
+        const selected = index == model.proposal_selected and model.focus == .content;
+        const prefix = try std.fmt.bufPrint(&prefix_buffer, "{s} {d: >2}. ", .{ if (selected) ">" else " ", index + 1 });
         const length = wrapChunkLength(candidate.title, content_columns);
-        try writer.print("\x1b[{d};{d}H{s}{s}{s}{s}", .{ row, panel.left + 1, panelStyle(dimmed), if (index == model.proposal_selected) "\x1b[7m" else "", prefix, candidate.title[0..length] });
-        if (index == model.proposal_selected) {
+        try writer.print("\x1b[{d};{d}H{s}{s}{s}{s}", .{ row, panel.left + 1, panelStyle(dimmed), if (selected) "\x1b[7m" else "", prefix, candidate.title[0..length] });
+        if (selected) {
             const used = displayWidth(prefix) + displayWidth(candidate.title[0..length]);
             var padding = (panel.width -| 2) -| used;
             while (padding > 0) : (padding -= 1) try writer.writeByte(' ');
@@ -255,39 +352,86 @@ fn renderProposalBase(writer: *std.Io.Writer, proposal: ?*const proposal_mod.Pro
         row += 1;
     }
     if (current.tasks.items.len == 0) try popupText(writer, row, panel.left, " Task候補はありません。", false, dimmed);
-    try popupText(writer, panel.bottom() - 1, panel.left, " j/k or ↑/↓ select  a add  e edit  d delete  K/J move  A approve  i import  q return  ? help", false, dimmed);
+    try popupTextClipped(writer, panel, panel.bottom() - 1, " j/k 選択  a 追加  e 編集  d 削除  K/J 移動  A 承認  i 取込  q 戻る", false, dimmed);
 }
 
-fn renderRepositoriesBase(writer: *std.Io.Writer, config: ?*const github_config.Config, model: Model, columns: u16, rows: u16, dimmed: bool) !void {
-    const panel = Panel.init(columns, rows, 0);
+fn renderRepositoriesBase(writer: *std.Io.Writer, config: ?*const github_config.Config, repository_tree: ?*const RepositoryTree, model: Model, panel: Panel, dimmed: bool) !void {
     try renderPanel(writer, panel, dimmed, false);
     try popupText(writer, panel.top + 1, panel.left, " ztodo  Repositories", true, dimmed);
-    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", borderStyle(dimmed));
+    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", panelStyle(dimmed));
     const repositories = if (config) |value| value.repositories else &.{};
     var row = panel.top + 4;
     if (repositories.len == 0) {
         try popupText(writer, row, panel.left, " Repositoryは登録されていません。", false, dimmed);
-    } else for (repositories, 0..) |repository, index| {
-        if (row >= panel.bottom() - 1) break;
-        var prefix_buffer: [32]u8 = undefined;
-        const prefix = try std.fmt.bufPrint(&prefix_buffer, "{s} {d: >2}. ", .{ if (index == model.repository_selected) ">" else " ", index + 1 });
-        try writer.print("\x1b[{d};{d}H{s}{s}{s}{s}", .{ row, panel.left + 1, panelStyle(dimmed), if (index == model.repository_selected) "\x1b[7m" else "", prefix, repository });
-        if (index == model.repository_selected) {
-            const used = displayWidth(prefix) + displayWidth(repository);
-            var padding = (panel.width -| 2) -| used;
-            while (padding > 0) : (padding -= 1) try writer.writeByte(' ');
+    } else {
+        const available_rows: usize = panel.height -| 5;
+        const selected_ordinal = if (repository_tree) |tree| repositoryTreeSelectionOrdinal(repositories, tree, model) else model.repository_selected;
+        const start = if (selected_ordinal >= available_rows) selected_ordinal - available_rows + 1 else 0;
+        var ordinal: usize = 0;
+        outer: for (repositories, 0..) |repository, index| {
+            const expanded = if (repository_tree) |tree| tree.isExpanded(repository) else false;
+            if (ordinal >= start) {
+                if (row >= panel.bottom() - 1) break;
+                var prefix_buffer: [16]u8 = undefined;
+                const selected = index == model.repository_selected and model.repository_issue_selected == null and model.focus == .content;
+                const prefix = try std.fmt.bufPrint(&prefix_buffer, "{s} {s} ", .{ if (selected) ">" else " ", if (expanded) "▾" else "▸" });
+                try renderRepositoryTreeLine(writer, row, panel, prefix, repository, selected, dimmed);
+                row += 1;
+            }
+            ordinal += 1;
+
+            const node = if (repository_tree) |tree| treeNode(tree, repository) else null;
+            if (node) |current| if (current.expanded and current.issues != null) {
+                for (current.issues.?.items, 0..) |issue, issue_index| {
+                    if (ordinal >= start) {
+                        if (row >= panel.bottom() - 1) break :outer;
+                        const selected = index == model.repository_selected and model.repository_issue_selected == issue_index and model.focus == .content;
+                        var prefix_buffer: [64]u8 = undefined;
+                        const prefix = try std.fmt.bufPrint(&prefix_buffer, "  {s} #{d} ", .{ if (selected) ">" else " ", issue.number });
+                        try renderRepositoryTreeLine(writer, row, panel, prefix, issue.title, selected, dimmed);
+                        row += 1;
+                    }
+                    ordinal += 1;
+                }
+            };
         }
-        try writer.writeAll("\x1b[0m");
-        row += 1;
     }
-    try popupText(writer, panel.bottom() - 1, panel.left, " j/k or ↑/↓ select  a add  d delete  q return  ? help", false, dimmed);
+    try popupTextClipped(writer, panel, panel.bottom() - 1, " j/k Repository・Issueを選択  Space 選択Repositoryを開閉  Enter 選択Issueのプロンプトをコピー  r Issueを再取得", false, dimmed);
 }
 
-fn renderIssuesBase(writer: *std.Io.Writer, issues: ?*const github_client.IssueList, model: Model, columns: u16, rows: u16, dimmed: bool) !void {
-    const panel = Panel.init(columns, rows, 0);
+fn treeNode(tree: *const RepositoryTree, repository: []const u8) ?*const RepositoryNode {
+    for (tree.nodes.items) |*node| {
+        if (std.mem.eql(u8, node.repository, repository)) return node;
+    }
+    return null;
+}
+
+fn repositoryTreeSelectionOrdinal(repositories: []const []const u8, tree: *const RepositoryTree, model: Model) usize {
+    var ordinal: usize = 0;
+    for (repositories, 0..) |repository, index| {
+        if (index == model.repository_selected)
+            return ordinal + if (model.repository_issue_selected) |issue_index| issue_index + 1 else 0;
+        ordinal += 1 + tree.issueCount(repository);
+    }
+    return ordinal;
+}
+
+fn renderRepositoryTreeLine(writer: *std.Io.Writer, row: u16, panel: Panel, prefix: []const u8, text: []const u8, selected: bool, dimmed: bool) !void {
+    const available = (panel.width -| 2) -| displayWidth(prefix);
+    const length = wrapChunkLength(text, available);
+    try writer.print("\x1b[{d};{d}H{s}{s}{s}{s}", .{ row, panel.left + 1, panelStyle(dimmed), if (selected) "\x1b[7m" else "", prefix, text[0..length] });
+    if (selected) {
+        const used = displayWidth(prefix) + displayWidth(text[0..length]);
+        var padding = (panel.width -| 2) -| used;
+        while (padding > 0) : (padding -= 1) try writer.writeByte(' ');
+    }
+    try writer.writeAll("\x1b[0m");
+}
+
+fn renderIssuesBase(writer: *std.Io.Writer, issues: ?*const github_client.IssueList, model: Model, panel: Panel, dimmed: bool) !void {
     try renderPanel(writer, panel, dimmed, false);
-    try popupText(writer, panel.top + 1, panel.left, " ztodo  GitHub Issues", true, dimmed);
-    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", borderStyle(dimmed));
+    try popupText(writer, panel.top + 1, panel.left, " GitHub Issues", true, dimmed);
+    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", panelStyle(dimmed));
     const items = if (issues) |value| value.items else &.{};
     var row = panel.top + 4;
     if (items.len == 0) {
@@ -295,11 +439,12 @@ fn renderIssuesBase(writer: *std.Io.Writer, issues: ?*const github_client.IssueL
     } else for (items, 0..) |issue, index| {
         if (row >= panel.bottom() - 1) break;
         var prefix_buffer: [512]u8 = undefined;
-        const prefix = try std.fmt.bufPrint(&prefix_buffer, "{s} {s}#{d} ", .{ if (index == model.issue_selected) ">" else " ", issue.repository, issue.number });
+        const selected = index == model.issue_selected and model.focus == .content;
+        const prefix = try std.fmt.bufPrint(&prefix_buffer, "{s} {s}#{d} ", .{ if (selected) ">" else " ", issue.repository, issue.number });
         const available = (panel.width -| 2) -| displayWidth(prefix);
         const length = wrapChunkLength(issue.title, available);
-        try writer.print("\x1b[{d};{d}H{s}{s}{s}{s}", .{ row, panel.left + 1, panelStyle(dimmed), if (index == model.issue_selected) "\x1b[7m" else "", prefix, issue.title[0..length] });
-        if (index == model.issue_selected) {
+        try writer.print("\x1b[{d};{d}H{s}{s}{s}{s}", .{ row, panel.left + 1, panelStyle(dimmed), if (selected) "\x1b[7m" else "", prefix, issue.title[0..length] });
+        if (selected) {
             const used = displayWidth(prefix) + displayWidth(issue.title[0..length]);
             var padding = (panel.width -| 2) -| used;
             while (padding > 0) : (padding -= 1) try writer.writeByte(' ');
@@ -307,7 +452,41 @@ fn renderIssuesBase(writer: *std.Io.Writer, issues: ?*const github_client.IssueL
         try writer.writeAll("\x1b[0m");
         row += 1;
     }
-    try popupText(writer, panel.bottom() - 1, panel.left, " j/k or ↑/↓ select  Enter copy prompt  q return  ? help", false, dimmed);
+    try popupTextClipped(writer, panel, panel.bottom() - 1, " j/k 選択  Enter コピー  q 戻る", false, dimmed);
+}
+
+fn renderPromptBase(writer: *std.Io.Writer, instructions: []const u8, panel: Panel, dimmed: bool) !void {
+    try renderPanel(writer, panel, dimmed, false);
+    try popupText(writer, panel.top + 1, panel.left, " プロンプト編集", true, dimmed);
+    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", panelStyle(dimmed));
+    try popupText(writer, panel.top + 3, panel.left, " AIへ追加する指示", true, dimmed);
+    if (instructions.len == 0)
+        try popupText(writer, panel.top + 5, panel.left, " 追加指示は設定されていません。", false, dimmed)
+    else
+        try renderPopupWrapped(writer, panel, panel.top + 5, instructions);
+    try popupTextClipped(writer, panel, panel.bottom() - 1, " e 外部エディタで編集  Tab メニュー", false, dimmed);
+}
+
+fn renderHelpBase(writer: *std.Io.Writer, panel: Panel, dimmed: bool) !void {
+    try renderPanel(writer, panel, dimmed, false);
+    try popupText(writer, panel.top + 1, panel.left, " ヘルプ", true, dimmed);
+    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", panelStyle(dimmed));
+    const lines = [_][]const u8{
+        " Tab       サイドバーと詳細のフォーカスを切り替える",
+        " j / ↓     次の項目を選択する",
+        " k / ↑     前の項目を選択する",
+        " Enter      サイドバーで選んだ画面を開く",
+        " q          戻る、または終了する",
+        " Ctrl-C     入力をキャンセル、通常時は終了する",
+        "",
+        " タスク: a 追加  e 編集  Space 完了  d 削除  K/J 並べ替え",
+        " Repository: a 追加  d 削除",
+        " Proposal: p 開く  i 取込  A 承認",
+        " Issue: g 開く  Enter プロンプトをコピー",
+    };
+    for (lines, 0..) |line, index|
+        try popupText(writer, panel.top + 4 + @as(u16, @intCast(index)), panel.left, line, false, dimmed);
+    try popupTextClipped(writer, panel, panel.bottom() - 1, " Tab メニュー", false, dimmed);
 }
 
 fn visibleStart(data: *const store.Data, selected: usize, available_rows: usize, first_columns: usize, continuation_columns: usize) usize {
@@ -476,14 +655,10 @@ fn panelStyle(dimmed: bool) []const u8 {
     return if (dimmed) "\x1b[2;39m\x1b[49m" else panel_style;
 }
 
-fn borderStyle(dimmed: bool) []const u8 {
-    return if (dimmed) "\x1b[2;39;48;2;229;221;176m" else border_style;
-}
-
 fn renderPanel(writer: *std.Io.Writer, panel: Panel, dimmed: bool, shadow: bool) !void {
     if (shadow) try renderShadow(writer, panel);
     const content_style = panelStyle(dimmed);
-    const frame_style = borderStyle(dimmed);
+    const frame_style = content_style;
     try popupLine(writer, panel.top, panel.left, panel.width, "┌", "─", "┐", frame_style);
     var row = panel.top + 1;
     while (row < panel.bottom()) : (row += 1) try popupContent(writer, row, panel.left, panel.width, frame_style, content_style);
@@ -560,17 +735,29 @@ fn renderPopup(writer: *std.Io.Writer, popup: Popup, screen: Screen, columns: u1
                     " q     : Tasksへ戻る",
                 },
                 .repositories => &.{
-                    " j / ↓ : 次のRepository",
-                    " k / ↑ : 前のRepository",
-                    " a     : Repositoryを追加",
-                    " d     : Repositoryを削除",
-                    " q     : Tasksへ戻る",
+                    " j / ↓ : 次のRepositoryまたはIssueを選択",
+                    " k / ↑ : 前のRepositoryまたはIssueを選択",
+                    " Space : 選択RepositoryのIssueを展開・折りたたみ",
+                    " Enter : 選択IssueのAI向けプロンプトをClipboardへコピー",
+                    " r     : 選択RepositoryのOpen Issueを再取得",
+                    " a     : Repositoryを一覧へ追加",
+                    " d     : 選択Repositoryを確認後に削除",
+                    " q     : サイドバーへ戻る",
                 },
                 .issues => &.{
                     " j / ↓ : 次のIssue",
                     " k / ↑ : 前のIssue",
                     " Enter : プロンプトをコピー",
                     " q     : Tasksへ戻る",
+                },
+                .prompt => &.{
+                    " e     : 外部エディタで編集",
+                    " Tab   : サイドバーへ移動",
+                    " q     : サイドバーへ戻る",
+                },
+                .help => &.{
+                    " Tab   : サイドバーへ移動",
+                    " q     : サイドバーへ戻る",
                 },
             };
             for (lines, 0..) |line, index| try popupText(writer, panel.top + 3 + @as(u16, @intCast(index)), panel.left, line, false, false);
@@ -648,9 +835,17 @@ fn renderPopupWrapped(writer: *std.Io.Writer, panel: Panel, first_row: u16, text
     var row = first_row;
     const columns: usize = panel.width -| 4;
     while (offset < text.len and row < panel.bottom() - 2) : (row += 1) {
-        const length = wrapChunkLength(text[offset..], columns);
-        try popupText(writer, row, panel.left + 1, text[offset .. offset + length], false, false);
+        const remaining = text[offset..];
+        const newline = std.mem.indexOfScalar(u8, remaining, '\n');
+        const line = if (newline) |index| remaining[0..index] else remaining;
+        if (line.len == 0) {
+            offset += if (newline != null) 1 else 0;
+            continue;
+        }
+        const length = wrapChunkLength(line, columns);
+        try popupText(writer, row, panel.left + 1, line[0..length], false, false);
         offset += length;
+        if (length == line.len and newline != null) offset += 1;
     }
 }
 
@@ -677,7 +872,12 @@ fn popupText(writer: *std.Io.Writer, row: u16, column: u16, content: []const u8,
     });
 }
 
-pub fn run(allocator: std.mem.Allocator, io: std.Io, path: []const u8, proposal_path: []const u8, config_path: []const u8, instructions_path: []const u8, data: *store.Data) !void {
+fn popupTextClipped(writer: *std.Io.Writer, panel: Panel, row: u16, content: []const u8, emphasized: bool, dimmed: bool) !void {
+    const length = wrapChunkLength(content, panel.width -| 2);
+    try popupText(writer, row, panel.left, content[0..length], emphasized, dimmed);
+}
+
+pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, path: []const u8, proposal_path: []const u8, config_path: []const u8, instructions_path: []const u8, data: *store.Data) !void {
     const stdin = std.Io.File.stdin();
     const stdout = std.Io.File.stdout();
     if (!try stdin.isTty(io) or !try stdout.isTty(io)) return error.NotATerminal;
@@ -714,13 +914,15 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, path: []const u8, proposal_
         else => return err,
     };
     defer if (config) |*value| value.deinit();
-    const instructions = try prompt_instructions.load(allocator, io, instructions_path);
+    var instructions = try prompt_instructions.load(allocator, io, instructions_path);
     defer allocator.free(instructions);
     var issues: ?github_client.IssueList = null;
     defer if (issues) |*value| value.deinit();
+    var repository_tree = RepositoryTree.init(allocator);
+    defer repository_tree.deinit();
     while (!model.quit) {
         const size = terminalSize(io, stdout);
-        try renderApplication(&out.interface, data, if (proposal) |*value| value else null, if (config) |*value| value else null, if (issues) |*value| value else null, model, size.columns, size.rows);
+        try renderApplication(&out.interface, data, if (proposal) |*value| value else null, if (config) |*value| value else null, if (issues) |*value| value else null, &repository_tree, instructions, model, size.columns, size.rows);
         try out.interface.flush();
         const event = readInputEvent(&input.interface) catch |err| switch (err) {
             error.EndOfStream => return,
@@ -735,11 +937,24 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, path: []const u8, proposal_
             .byte => |byte| commandKey(byte),
         };
         if (key == .switch_screen) {
-            if (model.screen == .tasks) model.screen = .proposal;
+            model.focus = if (model.focus == .sidebar) .content else .sidebar;
+            continue;
+        }
+        if (model.focus == .sidebar) {
+            handleSidebarKey(&model, key);
+            continue;
+        }
+        if (key == .focus_sidebar) {
+            model.focus = .sidebar;
+            continue;
+        }
+        if (key == .open_proposal and model.screen == .tasks) {
+            model.screen = .proposal;
             continue;
         }
         if (key == .open_repositories and model.screen == .tasks) {
             model.screen = .repositories;
+            model.sidebar_selected = .repositories;
             continue;
         }
         if (key == .open_issues and model.screen == .tasks) {
@@ -751,11 +966,36 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, path: []const u8, proposal_
             continue;
         }
         if (model.screen == .repositories) {
-            try handleRepositoryKey(&config, &model, key);
+            try handleRepositoryKey(allocator, io, &config, &repository_tree, instructions, &model, key);
             continue;
         }
         if (model.screen == .issues) {
             try handleIssueKey(allocator, io, instructions, &issues, &model, key);
+            continue;
+        }
+        if (model.screen == .prompt) {
+            if (key == .edit) {
+                try out.interface.writeAll("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
+                try out.interface.flush();
+                try std.posix.tcsetattr(stdin.handle, .FLUSH, original);
+                const edit_result = prompt_editor.edit(allocator, io, environ, instructions_path);
+                try std.posix.tcsetattr(stdin.handle, .FLUSH, raw);
+                try out.interface.writeAll("\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h");
+                if (edit_result) |_| {
+                    const refreshed = prompt_instructions.load(allocator, io, instructions_path) catch |err| {
+                        model.popup = .{ .error_message = promptEditorErrorMessage(err) };
+                        continue;
+                    };
+                    allocator.free(instructions);
+                    instructions = refreshed;
+                } else |err| {
+                    model.popup = .{ .error_message = promptEditorErrorMessage(err) };
+                }
+            } else if (key == .quit) model.focus = .sidebar;
+            continue;
+        }
+        if (model.screen == .help) {
+            if (key == .quit) model.focus = .sidebar;
             continue;
         }
         switch (key) {
@@ -816,11 +1056,42 @@ fn commandKey(byte: u8) Key {
         'd' => .delete,
         'C' => .clear,
         '\t' => .switch_screen,
+        'p' => .open_proposal,
+        'h' => .focus_sidebar,
         'A' => .approve,
         'i' => .import_proposal,
         'r' => .open_repositories,
         'g' => .open_issues,
         else => .other,
+    };
+}
+
+fn handleSidebarKey(model: *Model, key: Key) void {
+    const index: usize = @intFromEnum(model.sidebar_selected);
+    switch (key) {
+        .up, .scroll_previous => if (index > 0) {
+            model.sidebar_selected = @enumFromInt(index - 1);
+            activateSidebarItem(model);
+        },
+        .down, .scroll_next => if (index + 1 < 4) {
+            model.sidebar_selected = @enumFromInt(index + 1);
+            activateSidebarItem(model);
+        },
+        .accept => {
+            activateSidebarItem(model);
+            model.focus = .content;
+        },
+        .quit => model.quit = true,
+        else => {},
+    }
+}
+
+fn activateSidebarItem(model: *Model) void {
+    model.screen = switch (model.sidebar_selected) {
+        .tasks => .tasks,
+        .repositories => .repositories,
+        .prompt => .prompt,
+        .help => .help,
     };
 }
 
@@ -879,22 +1150,109 @@ fn handleProposalKey(
     }
 }
 
-fn handleRepositoryKey(config: *?github_config.Config, model: *Model, key: Key) !void {
+fn handleRepositoryKey(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: *?github_config.Config,
+    tree: *RepositoryTree,
+    instructions: []const u8,
+    model: *Model,
+    key: Key,
+) !void {
     const count = if (config.*) |*value| value.repositories.len else 0;
     switch (key) {
-        .up, .scroll_previous => if (model.repository_selected > 0) {
-            model.repository_selected -= 1;
+        .up, .scroll_previous => moveRepositoryTreeSelection(config, tree, model, false),
+        .down, .scroll_next => moveRepositoryTreeSelection(config, tree, model, true),
+        .toggle => if (count > 0) {
+            const repository = config.*.?.repositories[model.repository_selected];
+            const node = try tree.getOrCreate(repository);
+            if (model.repository_issue_selected != null) return;
+            if (node.expanded) {
+                node.expanded = false;
+            } else {
+                if (node.issues == null) {
+                    node.issues = github_client.listOpen(allocator, io, repository) catch |err| {
+                        model.popup = .{ .error_message = githubIssueErrorMessage(err) };
+                        return;
+                    };
+                }
+                node.expanded = true;
+            }
         },
-        .down, .scroll_next => if (model.repository_selected + 1 < count) {
-            model.repository_selected += 1;
+        .open_repositories => if (count > 0) {
+            const repository = config.*.?.repositories[model.repository_selected];
+            const node = try tree.getOrCreate(repository);
+            const loaded = github_client.listOpen(allocator, io, repository) catch |err| {
+                model.popup = .{ .error_message = githubIssueErrorMessage(err) };
+                return;
+            };
+            if (node.issues) |*previous| previous.deinit();
+            node.issues = loaded;
+            node.expanded = true;
+            if (model.repository_issue_selected) |selected| {
+                if (selected >= loaded.items.len) model.repository_issue_selected = if (loaded.items.len == 0) null else loaded.items.len - 1;
+            }
+        },
+        .accept => if (count > 0 and model.repository_issue_selected != null) {
+            const repository = config.*.?.repositories[model.repository_selected];
+            const node = tree.find(repository) orelse return;
+            const selected = node.issues.?.items[model.repository_issue_selected.?];
+            var issue = github_client.get(allocator, io, selected.repository, selected.number) catch |err| {
+                model.popup = .{ .error_message = githubIssueErrorMessage(err) };
+                return;
+            };
+            defer issue.deinit();
+            const prompt = github_prompt.buildWithInstructions(allocator, &issue, instructions) catch {
+                model.popup = .{ .error_message = " AI向けプロンプトを生成できませんでした。" };
+                return;
+            };
+            defer allocator.free(prompt);
+            clipboard.copy(allocator, io, prompt) catch |err| {
+                model.popup = .{ .error_message = proposalImportErrorMessage(err) };
+                return;
+            };
         },
         .add => model.popup = .{ .input = InputState.init(.repository_add, null, "") },
-        .delete => if (count > 0) {
+        .delete => if (count > 0 and model.repository_issue_selected == null) {
             model.popup = .{ .confirmation = .{ .delete_repository = model.repository_selected } };
         },
         .help => model.popup = .help,
-        .quit => model.screen = .tasks,
+        .quit => model.focus = .sidebar,
         else => {},
+    }
+}
+
+fn moveRepositoryTreeSelection(
+    config: *const ?github_config.Config,
+    tree: *const RepositoryTree,
+    model: *Model,
+    down: bool,
+) void {
+    const current = if (config.*) |*value| value else return;
+    if (current.repositories.len == 0) return;
+    const issue_count = tree.issueCount(current.repositories[model.repository_selected]);
+    if (down) {
+        if (model.repository_issue_selected) |issue_index| {
+            if (issue_index + 1 < issue_count) {
+                model.repository_issue_selected = issue_index + 1;
+            } else if (model.repository_selected + 1 < current.repositories.len) {
+                model.repository_selected += 1;
+                model.repository_issue_selected = null;
+            }
+        } else if (issue_count > 0) {
+            model.repository_issue_selected = 0;
+        } else if (model.repository_selected + 1 < current.repositories.len) {
+            model.repository_selected += 1;
+        }
+        return;
+    }
+
+    if (model.repository_issue_selected) |issue_index| {
+        model.repository_issue_selected = if (issue_index == 0) null else issue_index - 1;
+    } else if (model.repository_selected > 0) {
+        model.repository_selected -= 1;
+        const previous_count = tree.issueCount(current.repositories[model.repository_selected]);
+        model.repository_issue_selected = if (previous_count == 0) null else previous_count - 1;
     }
 }
 
@@ -972,6 +1330,21 @@ fn githubIssueErrorMessage(err: anyerror) []const u8 {
         error.InvalidGitHubOutput => " GitHub CLIから不正なIssueデータが返されました。",
         error.TooManyGitHubIssues => " Open Issueが多すぎます。",
         else => " GitHub Issueを取得できませんでした。",
+    };
+}
+
+fn promptEditorErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.EditorNotConfigured => " VISUALまたはEDITORを設定してください。",
+        error.EditorNotFound => " 設定されたエディタが見つかりません。",
+        error.EditorFailed => " エディタが失敗しました。既存の追加指示は保持されています。",
+        error.PromptInstructionsTooLarge => " 追加指示は64 KiB以内にしてください。",
+        error.InvalidPromptInstructions => " 追加指示は有効なUTF-8で入力してください。",
+        error.PromptInstructionsReadFailed => " 追加指示を読み込めませんでした。",
+        error.CreatePromptInstructionsDirectoryFailed,
+        error.PromptInstructionsWriteFailed,
+        => " 追加指示を保存できませんでした。既存の内容は保持されています。",
+        else => " 追加指示を編集できませんでした。",
     };
 }
 
@@ -1167,6 +1540,7 @@ fn applyInput(
                 return;
             };
             model.repository_selected = config.*.?.repositories.len - 1;
+            model.repository_issue_selected = null;
             model.popup = null;
         },
     }
@@ -1296,6 +1670,7 @@ fn applyConfirmation(
             };
             const count = config.*.?.repositories.len;
             if (count == 0) model.repository_selected = 0 else if (model.repository_selected >= count) model.repository_selected = count - 1;
+            model.repository_issue_selected = null;
             model.popup = null;
         },
     }
@@ -1365,6 +1740,34 @@ test "model selection stays within task bounds" {
     try std.testing.expectEqual(@as(usize, 0), model.selected);
     model.update(.quit, 2);
     try std.testing.expect(model.quit);
+}
+
+test "sidebar selection changes the detail screen" {
+    var model: Model = .{ .focus = .sidebar };
+    handleSidebarKey(&model, .down);
+    try std.testing.expectEqual(SidebarItem.repositories, model.sidebar_selected);
+    try std.testing.expectEqual(Screen.repositories, model.screen);
+    handleSidebarKey(&model, .down);
+    try std.testing.expectEqual(Screen.prompt, model.screen);
+    handleSidebarKey(&model, .accept);
+    try std.testing.expectEqual(Focus.content, model.focus);
+}
+
+test "sidebar and prompt details render in two panes" {
+    var data = store.Data.init(std.testing.allocator);
+    defer data.deinit();
+    var buffer: [32 * 1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try renderApplication(&writer, &data, null, null, null, null, "日本語で回答する\n変更を小さくする", .{ .screen = .prompt, .sidebar_selected = .prompt }, 100, 30);
+    const output = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "ztodo v" ++ build_options.version) != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "タスク一覧") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "リポジトリ一覧") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "プロンプト編集") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "ヘルプ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "日本語で回答する") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "変更を小さくする") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "e 外部エディタで編集") != null);
 }
 
 test "key decoder supports arrows vim keys and interrupt" {
@@ -1590,8 +1993,11 @@ test "tui repository management persists additions and deletions" {
     try std.testing.expectEqual(@as(usize, 0), config.?.repositories.len);
     try std.testing.expectEqual(@as(usize, 0), model.repository_selected);
 
-    try handleRepositoryKey(&config, &model, .quit);
-    try std.testing.expectEqual(Screen.tasks, model.screen);
+    var tree = RepositoryTree.init(allocator);
+    defer tree.deinit();
+    try handleRepositoryKey(allocator, io, &config, &tree, "", &model, .quit);
+    try std.testing.expectEqual(Screen.repositories, model.screen);
+    try std.testing.expectEqual(Focus.sidebar, model.focus);
     try std.testing.expect(!model.quit);
 }
 
@@ -1611,6 +2017,44 @@ test "issue screen uses j k selection and q returns to tasks" {
     try std.testing.expect(!model.quit);
 }
 
+test "repository tree renders expanded issues and navigates visible rows" {
+    const allocator = std.testing.allocator;
+    var repositories = [_][]const u8{ "owner/repo", "owner/second" };
+    const config_value: github_config.Config = .{ .allocator = allocator, .repositories = &repositories };
+    const config: ?github_config.Config = config_value;
+    var tree = RepositoryTree.init(allocator);
+    defer tree.deinit();
+    const node = try tree.getOrCreate("owner/repo");
+    const items = try allocator.alloc(github_client.IssueSummary, 1);
+    items[0] = .{
+        .repository = try allocator.dupe(u8, "owner/repo"),
+        .number = 12,
+        .title = try allocator.dupe(u8, "Issue title"),
+    };
+    node.issues = .{ .allocator = allocator, .items = items };
+    node.expanded = true;
+
+    var data = store.Data.init(allocator);
+    defer data.deinit();
+    var buffer: [32 * 1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    var model: Model = .{ .screen = .repositories };
+    try renderApplication(&writer, &data, null, &config.?, null, &tree, "", model, 100, 30);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "▾") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "#12 Issue title") != null);
+
+    moveRepositoryTreeSelection(&config, &tree, &model, true);
+    try std.testing.expectEqual(@as(?usize, 0), model.repository_issue_selected);
+    moveRepositoryTreeSelection(&config, &tree, &model, true);
+    try std.testing.expectEqual(@as(usize, 1), model.repository_selected);
+    try std.testing.expectEqual(@as(?usize, null), model.repository_issue_selected);
+    moveRepositoryTreeSelection(&config, &tree, &model, false);
+    try std.testing.expectEqual(@as(usize, 0), model.repository_selected);
+    try std.testing.expectEqual(@as(?usize, 0), model.repository_issue_selected);
+    moveRepositoryTreeSelection(&config, &tree, &model, false);
+    try std.testing.expectEqual(@as(?usize, null), model.repository_issue_selected);
+}
+
 test "opening issues without repositories shows an error" {
     var config: ?github_config.Config = null;
     var issues: ?github_client.IssueList = null;
@@ -1628,7 +2072,7 @@ test "popup is rendered over the task list" {
     var writer: std.Io.Writer = .fixed(&buffer);
     try render(&writer, &data, .{ .popup = .help }, 80, 24);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), panelStyle(true)) != null);
-    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "ztodo  Tasks") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "タスク一覧") != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\x1b[2;2H") != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\x1b[23;2H") != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "?: このヘルプ") == null);
@@ -1637,7 +2081,7 @@ test "popup is rendered over the task list" {
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "┘") != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "▓") != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), panel_style) != null);
-    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), border_style) != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\x1b[48;2;229;221;176m") == null);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "Enter / q") != null);
 }
 
@@ -1669,9 +2113,9 @@ test "long unicode task titles wrap with continuation indented one column" {
     var buffer: [8192]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     try render(&writer, &data, .{}, 48, 24);
-    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "あいうえおかきくけこさしすせそたち") != null);
-    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\x1b[5;15H") != null);
-    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "つてと") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "あいうえおか") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\x1b[5;36H") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "てと") != null);
 }
 
 test "base panel fills a larger terminal" {

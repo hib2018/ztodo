@@ -113,5 +113,9 @@ ztodo clear
 - `Tab`：Proposal画面
 - `r`：Repositories画面
 - `g`：Issues画面
+- Repositories画面の`Space`：選択中Repositoryを開閉し、Issueを直下へ展開
+- Repositories画面の`Enter`：選択中IssueのプロンプトをClipboardへコピー
+- Repositories画面の`r`：選択中RepositoryのIssueを再取得
+- プロンプト編集画面の`e`：外部エディタでAIへの追加指示を編集
 
 全操作は[TUI操作設計](tui-design.md)を参照してください。

@@ -69,6 +69,8 @@ ztodo prop
 ztodo
 ```
 
+TUIは左側のサイドバーからタスク一覧、リポジトリ一覧、プロンプト編集、ヘルプを選び、右側の詳細画面で操作します。`Tab`でサイドバーと詳細画面のフォーカスを切り替えます。Task一覧からは`p`でProposal、`g`でGitHub Issue一覧を開けます。
+
 ## Documentation
 
 - [基本的な使い方](docs/guide.md)
