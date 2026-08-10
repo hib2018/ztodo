@@ -24,4 +24,4 @@
 
 `del`と`clear`は確認なしで実行され、元に戻せません。TUIでの削除と全削除は小文字の`y`による確認があります。
 
-バージョン番号は`build.zig.zon`の`.version`で一元管理されます。CLIの`ztodo version`とTUIヘルプはビルド時に同じ値を参照します。
+バージョン番号は`build.zig.zon`の`.version`で一元管理されます。CLIの`ztodo version`とTUI右下の表示は、ビルド時に同じ値を参照します。

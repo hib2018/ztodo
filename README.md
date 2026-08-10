@@ -69,7 +69,7 @@ ztodo prop
 ztodo
 ```
 
-TUIは左側のサイドバーからタスク一覧、リポジトリ一覧、プロンプト編集、ヘルプを選び、右側の詳細画面で操作します。`Tab`でサイドバーと詳細画面のフォーカスを切り替えます。Task一覧からは`p`でProposal、`g`でGitHub Issue一覧を開けます。
+TUIはTasksとRepositories / Issuesの2ペイン構成です。`Tab`でフォーカスを切り替え、現在使える操作は画面下部のHelpで確認できます。詳しくは[基本的な使い方](docs/guide.md#tuiを使う)を参照してください。
 
 ## Documentation
 
@@ -77,7 +77,6 @@ TUIは左側のサイドバーからタスク一覧、リポジトリ一覧、�
 - [コマンドリファレンス](docs/command-reference.md)
 - [設定・保存先・データ安全性](docs/configuration.md)
 - [外部ツールとの連携](docs/integrations.md)
-- [TUI操作設計](docs/tui-design.md)
 - [開発ガイド](docs/development.md)
 
 CLIの概要は`ztodo help`でも確認できます。

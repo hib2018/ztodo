@@ -103,19 +103,45 @@ ztodo del 1
 ztodo clear
 ```
 
-引数なしの`ztodo`はTUIを起動します。主要な操作は次のとおりです。
+## TUIを使う
+
+引数なしの`ztodo`はTUIを起動します。左にTasks、右にRepositories / Issuesなどの補助画面、下部に現在使える操作を表示します。登録済みRepositoryのOpen Issueは起動時に読み込まれるため、通常は`Space`ですぐに展開できます。取得に失敗した場合はエラーを表示し、`r`で再取得できます。
+
+共通操作：
+
+- `Tab`：Tasksと右ペインのフォーカスを切り替える
+- `?`：フォーカス中の画面に対応した詳細ヘルプを開く
+- `Esc`：popupまたは編集中の入力をキャンセルする
+- `q`：TasksではTUIを終了し、右ペインでは一つ前へ戻る
+
+Tasks：
 
 - `j` / `k`または`↓` / `↑`：Taskを選択
 - `a` / `e`：追加・編集
 - `Space`：完了状態を切り替え
 - `d` / `C`：確認後に一件削除・全削除
 - `K` / `J`：並べ替え
-- `Tab`：Proposal画面
-- `r`：Repositories画面
-- `g`：Issues画面
-- Repositories画面の`Space`：選択中Repositoryを開閉し、Issueを直下へ展開
-- Repositories画面の`Enter`：選択中IssueのプロンプトをClipboardへコピー
-- Repositories画面の`r`：選択中RepositoryのIssueを再取得
-- プロンプト編集画面の`e`：外部エディタでAIへの追加指示を編集
+- `r`：Repositories / Issuesを右ペインに表示
+- `p`：Proposalを右ペインに表示
+- `g`：全RepositoryのOpen Issue一覧を右ペインに表示
+- `P`：プロンプト編集を右ペインに表示
 
-全操作は[TUI操作設計](tui-design.md)を参照してください。
+Repositories / Issues：
+
+- `j` / `k`または`↓` / `↑`：Repositoryまたは展開済みIssueを選択
+- `Space`：Repositoryを開閉し、Issueを直下へ展開
+- `Enter`：選択IssueのAI向けプロンプトをClipboardへコピー
+- `r`：選択RepositoryのIssueを再取得
+- `a` / `d`：Repositoryを追加・確認後に削除
+
+Proposal：
+
+- `j` / `k`：Task候補を選択
+- `a` / `e` / `d`：Task候補を追加・編集・確認後に削除
+- `K` / `J`：並べ替え
+- `i`：ClipboardからProposal JSONを取り込む
+- `A`：確認後、ProposalをTaskへ適用する
+
+全Issue一覧では`j` / `k`で選択し、`Enter`でAI向けプロンプトをClipboardへコピーします。プロンプト編集では`e`で`VISUAL`または`EDITOR`を起動します。
+
+削除や承認は確認popupを表示し、小文字の`y`だけで確定します。それ以外の入力はキャンセルとして扱います。
