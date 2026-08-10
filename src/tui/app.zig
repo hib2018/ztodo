@@ -16,6 +16,7 @@ pub const min_rows: u16 = 12;
 
 const panel_style = "\x1b[39m\x1b[49m";
 const panel_heading_style = "\x1b[1;39m\x1b[49m";
+const border_style = "\x1b[39m\x1b[48;2;229;221;176m";
 const shadow_style = "\x1b[2;39m";
 
 const Size = struct {
@@ -43,6 +44,10 @@ const InputState = struct {
 
     fn value(self: *const InputState) []const u8 {
         return self.buffer[0..self.length];
+    }
+
+    fn displayValue(self: *const InputState) []const u8 {
+        return completeUtf8Prefix(self.value());
     }
 
     fn append(self: *InputState, byte: u8) void {
@@ -177,7 +182,10 @@ fn renderApplication(writer: *std.Io.Writer, data: *const store.Data, proposal: 
         .repositories => try renderRepositoriesBase(writer, config, model, columns, rows, model.popup != null),
         .issues => try renderIssuesBase(writer, issues, model, columns, rows, model.popup != null),
     }
-    if (model.popup) |popup| try renderPopup(writer, popup, model.screen, columns, rows);
+    if (model.popup) |popup|
+        try renderPopup(writer, popup, model.screen, columns, rows)
+    else
+        try writer.writeAll("\x1b[?25l");
 }
 
 fn renderBase(writer: *std.Io.Writer, data: *const store.Data, model: Model, columns: u16, rows: u16, dimmed: bool) !void {
@@ -185,7 +193,7 @@ fn renderBase(writer: *std.Io.Writer, data: *const store.Data, model: Model, col
     const panel = Panel.init(columns, rows, 0);
     try renderPanel(writer, panel, dimmed, false);
     try popupText(writer, panel.top + 1, panel.left, " ztodo  Tasks", true, dimmed);
-    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", panelStyle(dimmed));
+    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", borderStyle(dimmed));
 
     const task_row = panel.top + 3;
     const available_rows: usize = panel.height -| 5;
@@ -220,7 +228,7 @@ fn renderProposalBase(writer: *std.Io.Writer, proposal: ?*const proposal_mod.Pro
     const panel = Panel.init(columns, rows, 0);
     try renderPanel(writer, panel, dimmed, false);
     try popupText(writer, panel.top + 1, panel.left, " ztodo  Proposal", true, dimmed);
-    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", panelStyle(dimmed));
+    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", borderStyle(dimmed));
     const current = proposal orelse {
         try popupText(writer, panel.top + 4, panel.left, " Proposalはありません。iでClipboardから取り込めます。", false, dimmed);
         try popupText(writer, panel.bottom() - 1, panel.left, " i import  q return  ? help", false, dimmed);
@@ -253,7 +261,7 @@ fn renderRepositoriesBase(writer: *std.Io.Writer, config: ?*const github_config.
     const panel = Panel.init(columns, rows, 0);
     try renderPanel(writer, panel, dimmed, false);
     try popupText(writer, panel.top + 1, panel.left, " ztodo  Repositories", true, dimmed);
-    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", panelStyle(dimmed));
+    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", borderStyle(dimmed));
     const repositories = if (config) |value| value.repositories else &.{};
     var row = panel.top + 4;
     if (repositories.len == 0) {
@@ -278,7 +286,7 @@ fn renderIssuesBase(writer: *std.Io.Writer, issues: ?*const github_client.IssueL
     const panel = Panel.init(columns, rows, 0);
     try renderPanel(writer, panel, dimmed, false);
     try popupText(writer, panel.top + 1, panel.left, " ztodo  GitHub Issues", true, dimmed);
-    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", panelStyle(dimmed));
+    try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", borderStyle(dimmed));
     const items = if (issues) |value| value.items else &.{};
     var row = panel.top + 4;
     if (items.len == 0) {
@@ -325,7 +333,7 @@ fn renderTask(
     continuation_columns: usize,
 ) !usize {
     const marker = if (selected) ">" else " ";
-    const task_style = if (task.status == .done) "\x1b[2m" else style;
+    const task_style = if (task.status == .done) "\x1b[2;9m" else style;
     var prefix_buffer: [64]u8 = undefined;
     const prefix = try std.fmt.bufPrint(&prefix_buffer, "{s} [{s}] {d: >4}  ", .{
         marker,
@@ -353,7 +361,7 @@ fn renderTask(
             if (line == 0) prefix else "",
             chunk,
         });
-        if (selected) {
+        if (selected or task.status == .done) {
             var remaining = padding;
             while (remaining > 0) : (remaining -= 1) try writer.writeByte(' ');
         }
@@ -378,13 +386,11 @@ fn wrapChunkLength(text: []const u8, max_columns: usize) usize {
     var offset: usize = 0;
     var columns: usize = 0;
     while (offset < text.len) {
-        const sequence_length = std.unicode.utf8ByteSequenceLength(text[offset]) catch 1;
-        const end = @min(text.len, offset + sequence_length);
-        const codepoint = std.unicode.utf8Decode(text[offset..end]) catch @as(u21, text[offset]);
-        const width = codepointWidth(codepoint);
+        const unit = displayUnit(text[offset..]);
+        const width = codepointWidth(unit.codepoint);
         if (offset > 0 and columns + width > max_columns) break;
         columns += width;
-        offset = end;
+        offset += unit.length;
     }
     return @max(offset, 1);
 }
@@ -393,13 +399,34 @@ fn displayWidth(text: []const u8) usize {
     var offset: usize = 0;
     var columns: usize = 0;
     while (offset < text.len) {
-        const sequence_length = std.unicode.utf8ByteSequenceLength(text[offset]) catch 1;
-        const end = @min(text.len, offset + sequence_length);
-        const codepoint = std.unicode.utf8Decode(text[offset..end]) catch @as(u21, text[offset]);
-        columns += codepointWidth(codepoint);
-        offset = end;
+        const unit = displayUnit(text[offset..]);
+        columns += codepointWidth(unit.codepoint);
+        offset += unit.length;
     }
     return columns;
+}
+
+const DisplayUnit = struct { length: usize, codepoint: u21 };
+
+fn displayUnit(text: []const u8) DisplayUnit {
+    const sequence_length = std.unicode.utf8ByteSequenceLength(text[0]) catch
+        return .{ .length = 1, .codepoint = text[0] };
+    if (sequence_length > text.len)
+        return .{ .length = 1, .codepoint = text[0] };
+    const codepoint = std.unicode.utf8Decode(text[0..sequence_length]) catch
+        return .{ .length = 1, .codepoint = text[0] };
+    return .{ .length = sequence_length, .codepoint = codepoint };
+}
+
+fn completeUtf8Prefix(text: []const u8) []const u8 {
+    var offset: usize = 0;
+    while (offset < text.len) {
+        const sequence_length = std.unicode.utf8ByteSequenceLength(text[offset]) catch return text[0..offset];
+        if (sequence_length > text.len - offset) return text[0..offset];
+        _ = std.unicode.utf8Decode(text[offset .. offset + sequence_length]) catch return text[0..offset];
+        offset += sequence_length;
+    }
+    return text;
 }
 
 fn codepointWidth(codepoint: u21) usize {
@@ -448,13 +475,18 @@ fn panelStyle(dimmed: bool) []const u8 {
     return if (dimmed) "\x1b[2;39m\x1b[49m" else panel_style;
 }
 
+fn borderStyle(dimmed: bool) []const u8 {
+    return if (dimmed) "\x1b[2;39;48;2;229;221;176m" else border_style;
+}
+
 fn renderPanel(writer: *std.Io.Writer, panel: Panel, dimmed: bool, shadow: bool) !void {
     if (shadow) try renderShadow(writer, panel);
-    const style = panelStyle(dimmed);
-    try popupLine(writer, panel.top, panel.left, panel.width, "┌", "─", "┐", style);
+    const content_style = panelStyle(dimmed);
+    const frame_style = borderStyle(dimmed);
+    try popupLine(writer, panel.top, panel.left, panel.width, "┌", "─", "┐", frame_style);
     var row = panel.top + 1;
-    while (row < panel.bottom()) : (row += 1) try popupContent(writer, row, panel.left, panel.width, style);
-    try popupLine(writer, panel.bottom(), panel.left, panel.width, "└", "─", "┘", style);
+    while (row < panel.bottom()) : (row += 1) try popupContent(writer, row, panel.left, panel.width, frame_style, content_style);
+    try popupLine(writer, panel.bottom(), panel.left, panel.width, "└", "─", "┘", frame_style);
 }
 
 fn renderShadow(writer: *std.Io.Writer, panel: Panel) !void {
@@ -544,7 +576,7 @@ fn renderPopup(writer: *std.Io.Writer, popup: Popup, screen: Screen, columns: u1
         },
         .input => |input| {
             try popupText(writer, panel.top + 3, panel.left, if (input.action == .repository_add) " Repository:" else " タイトル:", false, false);
-            try renderPopupWrapped(writer, panel, panel.top + 4, input.value());
+            try renderPopupWrapped(writer, panel, panel.top + 4, input.displayValue());
             if (input.error_message) |message|
                 try popupText(writer, panel.bottom() - 3, panel.left, message, false, false);
         },
@@ -576,6 +608,38 @@ fn renderPopup(writer: *std.Io.Writer, popup: Popup, screen: Screen, columns: u1
         .confirmation => " y: 実行   n/q: キャンセル",
         else => " Enter / q: 閉じる",
     }, false, false);
+    switch (popup) {
+        .input => |input| try renderInputCursor(writer, panel, input),
+        else => try writer.writeAll("\x1b[?25l"),
+    }
+}
+
+const CursorPosition = struct { row: u16, column: u16 };
+
+fn inputCursorPosition(panel: Panel, text: []const u8) CursorPosition {
+    const first_row = panel.top + 4;
+    const first_column = panel.left + 2;
+    const columns: usize = panel.width -| 4;
+    const last_row = panel.bottom() -| 3;
+    if (text.len == 0 or columns == 0) return .{ .row = first_row, .column = first_column };
+
+    var offset: usize = 0;
+    var row = first_row;
+    while (offset < text.len) {
+        const length = wrapChunkLength(text[offset..], columns);
+        const width = displayWidth(text[offset .. offset + length]);
+        offset += length;
+        if (offset == text.len and width < columns)
+            return .{ .row = @min(row, last_row), .column = first_column + @as(u16, @intCast(width)) };
+        if (row >= last_row) return .{ .row = last_row, .column = first_column };
+        row += 1;
+    }
+    return .{ .row = @min(row, last_row), .column = first_column };
+}
+
+fn renderInputCursor(writer: *std.Io.Writer, panel: Panel, input: InputState) !void {
+    const position = inputCursorPosition(panel, input.displayValue());
+    try writer.print("\x1b[?25h\x1b[{d};{d}H", .{ position.row, position.column });
 }
 
 fn renderPopupWrapped(writer: *std.Io.Writer, panel: Panel, first_row: u16, text: []const u8) !void {
@@ -596,11 +660,11 @@ fn popupLine(writer: *std.Io.Writer, row: u16, column: u16, width: u16, left_edg
     try writer.print("{s}\x1b[0m", .{right_edge});
 }
 
-fn popupContent(writer: *std.Io.Writer, row: u16, column: u16, width: u16, style: []const u8) !void {
-    try writer.print("\x1b[{d};{d}H{s}│", .{ row, column, style });
+fn popupContent(writer: *std.Io.Writer, row: u16, column: u16, width: u16, frame_style: []const u8, content_style: []const u8) !void {
+    try writer.print("\x1b[{d};{d}H{s}│{s}", .{ row, column, frame_style, content_style });
     var index: u16 = 0;
     while (index < width -| 2) : (index += 1) try writer.writeByte(' ');
-    try writer.writeAll("│\x1b[0m");
+    try writer.print("{s}│\x1b[0m", .{frame_style});
 }
 
 fn popupText(writer: *std.Io.Writer, row: u16, column: u16, content: []const u8, emphasized: bool, dimmed: bool) !void {
@@ -1015,6 +1079,10 @@ fn applyInput(
     model: *Model,
     input: *InputState,
 ) !void {
+    if (!std.unicode.utf8ValidateSlice(input.value())) {
+        input.error_message = " 入力中の文字を確定してから保存してください。";
+        return;
+    }
     switch (input.action) {
         .task_add => {
             const task = data.add(input.value()) catch |err| {
@@ -1348,6 +1416,46 @@ test "input backspace removes one complete utf8 codepoint" {
     try std.testing.expectEqualStrings("Task!", input.value());
 }
 
+test "input cursor follows unicode display width and wrapping" {
+    const panel: Panel = .{ .top = 1, .left = 1, .width = 10, .height = 12 };
+    var position = inputCursorPosition(panel, "あいa");
+    try std.testing.expectEqual(@as(u16, 5), position.row);
+    try std.testing.expectEqual(@as(u16, 8), position.column);
+
+    position = inputCursorPosition(panel, "あいう");
+    try std.testing.expectEqual(@as(u16, 6), position.row);
+    try std.testing.expectEqual(@as(u16, 3), position.column);
+}
+
+test "input rendering tolerates utf8 arriving one byte at a time" {
+    var data = store.Data.init(std.testing.allocator);
+    defer data.deinit();
+    var input = InputState.init(.task_add, null, "");
+
+    for ("日本語") |byte| {
+        input.append(byte);
+        var buffer: [32 * 1024]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        try render(&writer, &data, .{ .popup = .{ .input = input } }, 80, 24);
+    }
+
+    try std.testing.expectEqualStrings("日本語", input.displayValue());
+}
+
+test "text input popup shows the hardware cursor and normal screen hides it" {
+    var data = store.Data.init(std.testing.allocator);
+    defer data.deinit();
+    var buffer: [32 * 1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try render(&writer, &data, .{ .popup = .{ .input = InputState.init(.task_add, null, "日本語") } }, 80, 24);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\x1b[?25h") != null);
+
+    var normal_buffer: [16 * 1024]u8 = undefined;
+    var normal_writer: std.Io.Writer = .fixed(&normal_buffer);
+    try render(&normal_writer, &data, .{}, 80, 24);
+    try std.testing.expect(std.mem.indexOf(u8, normal_writer.buffered(), "\x1b[?25l") != null);
+}
+
 test "tui task operations persist through the shared store" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1512,7 +1620,7 @@ test "popup is rendered over the task list" {
     var data = store.Data.init(std.testing.allocator);
     defer data.deinit();
     _ = try data.add("first");
-    var buffer: [8192]u8 = undefined;
+    var buffer: [32 * 1024]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     try render(&writer, &data, .{ .popup = .help }, 80, 24);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), panelStyle(true)) != null);
@@ -1525,6 +1633,7 @@ test "popup is rendered over the task list" {
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "┘") != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "▓") != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), panel_style) != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), border_style) != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "Enter / q") != null);
 }
 
@@ -1534,12 +1643,19 @@ test "render shows tasks and selected row" {
     _ = try data.add("first");
     _ = try data.add("second");
     _ = try data.complete(2);
-    var buffer: [4096]u8 = undefined;
+    var buffer: [16 * 1024]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     try render(&writer, &data, .{ .selected = 1 }, 80, 24);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "[ ]    1  first") != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "[x]    2  second") != null);
-    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\x1b[2m\x1b[7m> [x]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\x1b[2;9m\x1b[7m> [x]") != null);
+}
+
+test "done task strikethrough extends to the right edge" {
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    _ = try renderTask(&writer, .{ .id = 1, .title = "done", .status = .done }, false, "", 1, 1, 2, 10, 9);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "done      \x1b[0m") != null);
 }
 
 test "long unicode task titles wrap with continuation indented one column" {

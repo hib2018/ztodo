@@ -214,6 +214,8 @@ ztodo clear
 
 `ztodo`では、`j` / `k`または`↓` / `↑`でTaskを選択します。`a`で追加、`e`で編集、`Space`で完了状態の切り替え、`d`で確認後に削除、`C`で確認後に全削除、`K` / `J`で並び替えができます。データ操作は成功するたびにAtomic保存されます。
 
+追加・編集の入力中は文字列末尾へカーソルを表示します。日本語IMEの変換候補位置として利用され、全角文字や折り返しを含む場合もTerminal上の表示幅に合わせて移動します。
+
 Tasks画面の`r`でRepositories画面を開きます。`a`で`owner/repository`形式のRepositoryを追加し、`d`で確認後に削除、`q`でTasks画面へ戻ります。
 
 Tasks画面の`g`で登録RepositoryのOpen Issueを取得します。Issues画面では`j` / `k`で選択し、`Enter`でIssue詳細を含むAI向けプロンプトをClipboardへコピーします。`q`でTasks画面へ戻ります。
@@ -240,6 +242,22 @@ Tasks画面の`Tab`でProposal画面を開きます。Proposal画面では`i`で
 | `ztodo version` | バージョンを表示する |
 
 バージョン番号は`build.zig.zon`の`.version`で一元管理されます。CLIの`ztodo version`とTUIヘルプは、ビルド時に同じ値を参照します。リリース時はSemantic Versioningに従ってこの値を更新し、同じ番号の`v`付きGitタグを作成します。
+
+## Herdrでポップアップ表示する
+
+Herdrの`~/.config/herdr/config.toml`へ次のカスタムコマンドを追加すると、`prefix+z`でztodoをセッションモーダルなポップアップとして起動できます。
+
+```toml
+[[keys.command]]
+key = "prefix+z"
+type = "popup"
+command = "ztodo"
+description = "Open ztodo in popup"
+width = "90%"
+height = "90%"
+```
+
+設定変更後は`herdr server reload-config`で反映します。ztodoを`q`で終了すると、元のHerdrペインへ戻ります。
 
 ## Zsh補完（任意）
 
