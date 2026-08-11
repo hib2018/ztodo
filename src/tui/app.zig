@@ -35,12 +35,14 @@ const InputState = struct {
     target_id: ?u64 = null,
     buffer: [max_input_bytes]u8 = undefined,
     length: usize = 0,
+    cursor: usize = 0,
     error_message: ?[]const u8 = null,
 
     fn init(action: InputAction, target_id: ?u64, initial: []const u8) InputState {
         var input: InputState = .{ .action = action, .target_id = target_id };
         input.length = @min(initial.len, input.buffer.len);
         @memcpy(input.buffer[0..input.length], initial[0..input.length]);
+        input.cursor = input.length;
         return input;
     }
 
@@ -54,18 +56,38 @@ const InputState = struct {
 
     fn append(self: *InputState, byte: u8) void {
         if (self.length == self.buffer.len) return;
-        self.buffer[self.length] = byte;
+        std.mem.copyBackwards(u8, self.buffer[self.cursor + 1 .. self.length + 1], self.buffer[self.cursor..self.length]);
+        self.buffer[self.cursor] = byte;
         self.length += 1;
+        self.cursor += 1;
         self.error_message = null;
     }
 
     fn backspace(self: *InputState) void {
-        if (self.length == 0) return;
-        self.length -= 1;
-        while (self.length > 0 and self.buffer[self.length] & 0xc0 == 0x80) self.length -= 1;
+        if (self.cursor == 0) return;
+        const previous = previousCodepointStart(self.buffer[0..self.length], self.cursor);
+        std.mem.copyForwards(u8, self.buffer[previous .. self.length - (self.cursor - previous)], self.buffer[self.cursor..self.length]);
+        self.length -= self.cursor - previous;
+        self.cursor = previous;
         self.error_message = null;
     }
+
+    fn moveLeft(self: *InputState) void {
+        if (self.cursor > 0) self.cursor = previousCodepointStart(self.buffer[0..self.length], self.cursor);
+    }
+
+    fn moveRight(self: *InputState) void {
+        if (self.cursor >= self.length) return;
+        const sequence_length = std.unicode.utf8ByteSequenceLength(self.buffer[self.cursor]) catch 1;
+        self.cursor = @min(self.cursor + sequence_length, self.length);
+    }
 };
+
+fn previousCodepointStart(text: []const u8, cursor: usize) usize {
+    var previous = cursor - 1;
+    while (previous > 0 and text[previous] & 0xc0 == 0x80) previous -= 1;
+    return previous;
+}
 
 const Confirmation = union(enum) {
     delete_task: struct { id: u64, index: usize },
@@ -155,6 +177,8 @@ fn preloadRepositoryIssues(allocator: std.mem.Allocator, io: std.Io, config: ?*c
 pub const Key = enum {
     up,
     down,
+    left,
+    right,
     scroll_next,
     scroll_previous,
     move_up,
@@ -210,7 +234,7 @@ pub const Model = struct {
             .down, .scroll_next => if (self.selected + 1 < task_count) {
                 self.selected += 1;
             },
-            .move_up, .move_down, .add, .edit, .toggle, .delete, .clear, .switch_screen, .approve, .import_proposal, .open_repositories, .open_issues, .open_proposal, .open_prompt, .focus_tasks, .help, .accept, .backspace => {},
+            .left, .right, .move_up, .move_down, .add, .edit, .toggle, .delete, .clear, .switch_screen, .approve, .import_proposal, .open_repositories, .open_issues, .open_proposal, .open_prompt, .focus_tasks, .help, .accept, .backspace => {},
             .quit => self.quit = true,
             .other => {},
         }
@@ -228,6 +252,8 @@ pub fn decodeKey(first: u8, second: ?u8, third: ?u8) Key {
     if (first == 'J') return .move_down;
     if (first == 0x1b and second == '[' and third == 'A') return .up;
     if (first == 0x1b and second == '[' and third == 'B') return .down;
+    if (first == 0x1b and second == '[' and third == 'D') return .left;
+    if (first == 0x1b and second == '[' and third == 'C') return .right;
     return .other;
 }
 
@@ -328,23 +354,17 @@ fn renderProposalBase(writer: *std.Io.Writer, proposal: ?*const proposal_mod.Pro
     };
     var source_buffer: [512]u8 = undefined;
     const source = try std.fmt.bufPrint(&source_buffer, " {s}#{d}  {s}", .{ current.source.repository, current.source.issue_number, current.source.issue_title });
-    try popupTextClipped(writer, panel, panel.top + 3, source, false, dimmed);
-    const content_columns: usize = panel.width -| 8;
-    var row = panel.top + 5;
+    var row = panel.top + 3;
+    row += try renderWrappedRightLine(writer, row, panel.bottom(), panel, source, 1, false, dimmed);
+    row += 1;
     for (current.tasks.items, 0..) |candidate, index| {
-        if (row >= panel.bottom() - 1) break;
+        if (row >= panel.bottom()) break;
         var prefix_buffer: [32]u8 = undefined;
         const selected = index == model.proposal_selected and model.focus == .right;
         const prefix = try std.fmt.bufPrint(&prefix_buffer, "{s} {d: >2}. ", .{ if (selected) ">" else " ", index + 1 });
-        const length = wrapChunkLength(candidate.title, content_columns);
-        try writer.print("\x1b[{d};{d}H{s}{s}{s}{s}", .{ row, panel.left + 1, panelStyle(dimmed), if (selected) "\x1b[7m" else "", prefix, candidate.title[0..length] });
-        if (selected) {
-            const used = displayWidth(prefix) + displayWidth(candidate.title[0..length]);
-            var padding = (panel.width -| 2) -| used;
-            while (padding > 0) : (padding -= 1) try writer.writeByte(' ');
-        }
-        try writer.writeAll("\x1b[0m");
-        row += 1;
+        var line_buffer: [1024]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buffer, "{s}{s}", .{ prefix, candidate.title });
+        row += try renderWrappedRightLine(writer, row, panel.bottom(), panel, line, displayWidth(prefix), selected, dimmed);
     }
     if (current.tasks.items.len == 0) try popupText(writer, row, panel.left, " Task候補はありません。", false, dimmed);
 }
@@ -365,12 +385,11 @@ fn renderRepositoriesBase(writer: *std.Io.Writer, config: ?*const github_config.
         outer: for (repositories, 0..) |repository, index| {
             const expanded = if (repository_tree) |tree| tree.isExpanded(repository) else false;
             if (ordinal >= start) {
-                if (row >= panel.bottom() - 1) break;
+                if (row >= panel.bottom()) break;
                 var prefix_buffer: [16]u8 = undefined;
                 const selected = index == model.repository_selected and model.repository_issue_selected == null and model.focus == .right;
                 const prefix = try std.fmt.bufPrint(&prefix_buffer, "{s} {s} ", .{ if (selected) ">" else " ", if (expanded) "▾" else "▸" });
-                try renderRepositoryTreeLine(writer, row, panel, prefix, repository, selected, dimmed);
-                row += 1;
+                row += try renderRepositoryTreeLine(writer, row, panel, prefix, repository, selected, dimmed);
             }
             ordinal += 1;
 
@@ -378,12 +397,11 @@ fn renderRepositoriesBase(writer: *std.Io.Writer, config: ?*const github_config.
             if (node) |current| if (current.expanded and current.issues != null) {
                 for (current.issues.?.items, 0..) |issue, issue_index| {
                     if (ordinal >= start) {
-                        if (row >= panel.bottom() - 1) break :outer;
+                        if (row >= panel.bottom()) break :outer;
                         const selected = index == model.repository_selected and model.repository_issue_selected == issue_index and model.focus == .right;
                         var prefix_buffer: [64]u8 = undefined;
                         const prefix = try std.fmt.bufPrint(&prefix_buffer, "  {s} #{d} ", .{ if (selected) ">" else " ", issue.number });
-                        try renderRepositoryTreeLine(writer, row, panel, prefix, issue.title, selected, dimmed);
-                        row += 1;
+                        row += try renderRepositoryTreeLine(writer, row, panel, prefix, issue.title, selected, dimmed);
                     }
                     ordinal += 1;
                 }
@@ -409,16 +427,48 @@ fn repositoryTreeSelectionOrdinal(repositories: []const []const u8, tree: *const
     return ordinal;
 }
 
-fn renderRepositoryTreeLine(writer: *std.Io.Writer, row: u16, panel: Panel, prefix: []const u8, text: []const u8, selected: bool, dimmed: bool) !void {
-    const available = (panel.width -| 2) -| displayWidth(prefix);
-    const length = wrapChunkLength(text, available);
-    try writer.print("\x1b[{d};{d}H{s}{s}{s}{s}", .{ row, panel.left + 1, panelStyle(dimmed), if (selected) "\x1b[7m" else "", prefix, text[0..length] });
-    if (selected) {
-        const used = displayWidth(prefix) + displayWidth(text[0..length]);
-        var padding = (panel.width -| 2) -| used;
-        while (padding > 0) : (padding -= 1) try writer.writeByte(' ');
+fn renderRepositoryTreeLine(writer: *std.Io.Writer, row: u16, panel: Panel, prefix: []const u8, text: []const u8, selected: bool, dimmed: bool) !u16 {
+    var line_buffer: [1024]u8 = undefined;
+    const line = try std.fmt.bufPrint(&line_buffer, "{s}{s}", .{ prefix, text });
+    return renderWrappedRightLine(writer, row, panel.bottom(), panel, line, displayWidth(prefix), selected, dimmed);
+}
+
+fn renderWrappedRightLine(
+    writer: *std.Io.Writer,
+    first_row: u16,
+    row_limit: u16,
+    panel: Panel,
+    text: []const u8,
+    requested_indent: usize,
+    selected: bool,
+    dimmed: bool,
+) !u16 {
+    const content_columns: usize = panel.width -| 2;
+    const continuation_indent = @min(requested_indent, content_columns / 2);
+    var offset: usize = 0;
+    var lines: u16 = 0;
+    while (offset < text.len and first_row + lines < row_limit) : (lines += 1) {
+        const indent = if (lines == 0) 0 else continuation_indent;
+        const columns = content_columns -| indent;
+        const length = wrapChunkLength(text[offset..], columns);
+        const chunk = text[offset .. offset + length];
+        try writer.print("\x1b[{d};{d}H{s}{s}", .{
+            first_row + lines,
+            panel.left + 1,
+            panelStyle(dimmed),
+            if (selected) "\x1b[7m" else "",
+        });
+        var spaces = indent;
+        while (spaces > 0) : (spaces -= 1) try writer.writeByte(' ');
+        try writer.writeAll(chunk);
+        if (selected) {
+            var padding = columns - displayWidth(chunk);
+            while (padding > 0) : (padding -= 1) try writer.writeByte(' ');
+        }
+        try writer.writeAll("\x1b[0m");
+        offset += length;
     }
-    try writer.writeAll("\x1b[0m");
+    return lines;
 }
 
 fn renderIssuesBase(writer: *std.Io.Writer, issues: ?*const github_client.IssueList, model: Model, panel: Panel, dimmed: bool) !void {
@@ -430,20 +480,13 @@ fn renderIssuesBase(writer: *std.Io.Writer, issues: ?*const github_client.IssueL
     if (items.len == 0) {
         try popupTextClipped(writer, panel, row, " Open Issueはありません。", false, dimmed);
     } else for (items, 0..) |issue, index| {
-        if (row >= panel.bottom() - 1) break;
+        if (row >= panel.bottom()) break;
         var prefix_buffer: [512]u8 = undefined;
         const selected = index == model.issue_selected and model.focus == .right;
         const prefix = try std.fmt.bufPrint(&prefix_buffer, "{s} {s}#{d} ", .{ if (selected) ">" else " ", issue.repository, issue.number });
-        const available = (panel.width -| 2) -| displayWidth(prefix);
-        const length = wrapChunkLength(issue.title, available);
-        try writer.print("\x1b[{d};{d}H{s}{s}{s}{s}", .{ row, panel.left + 1, panelStyle(dimmed), if (selected) "\x1b[7m" else "", prefix, issue.title[0..length] });
-        if (selected) {
-            const used = displayWidth(prefix) + displayWidth(issue.title[0..length]);
-            var padding = (panel.width -| 2) -| used;
-            while (padding > 0) : (padding -= 1) try writer.writeByte(' ');
-        }
-        try writer.writeAll("\x1b[0m");
-        row += 1;
+        var line_buffer: [1024]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buffer, "{s}{s}", .{ prefix, issue.title });
+        row += try renderWrappedRightLine(writer, row, panel.bottom(), panel, line, displayWidth(prefix), selected, dimmed);
     }
 }
 
@@ -807,7 +850,7 @@ fn renderPopup(writer: *std.Io.Writer, popup: Popup, screen: Screen, columns: u1
         },
     }
     try popupText(writer, panel.bottom() - 1, panel.left, switch (popup) {
-        .input => " Enter: 保存   Ctrl-C: キャンセル",
+        .input => " ←/→: カーソル移動   Enter: 保存   Ctrl-C: キャンセル",
         .confirmation => " y: 実行   n/q: キャンセル",
         else => " Enter / q: 閉じる",
     }, false, false);
@@ -841,7 +884,9 @@ fn inputCursorPosition(panel: Panel, text: []const u8) CursorPosition {
 }
 
 fn renderInputCursor(writer: *std.Io.Writer, panel: Panel, input: InputState) !void {
-    const position = inputCursorPosition(panel, input.displayValue());
+    const visible = input.displayValue();
+    const cursor = @min(input.cursor, visible.len);
+    const position = inputCursorPosition(panel, visible[0..cursor]);
     try writer.print("\x1b[?25h\x1b[{d};{d}H", .{ position.row, position.column });
 }
 
@@ -1426,6 +1471,8 @@ fn handlePopupEvent(
             .key => |key| switch (key) {
                 .accept => try applyInput(allocator, io, path, proposal_path, config_path, data, proposal, config, model, input),
                 .backspace => input.backspace(),
+                .left => input.moveLeft(),
+                .right => input.moveRight(),
                 .quit => model.popup = null,
                 else => {},
             },
@@ -1768,6 +1815,8 @@ test "tasks and prompt render as separated panes with contextual help" {
 test "key decoder supports arrows vim keys and interrupt" {
     try std.testing.expectEqual(Key.up, decodeKey(0x1b, '[', 'A'));
     try std.testing.expectEqual(Key.down, decodeKey(0x1b, '[', 'B'));
+    try std.testing.expectEqual(Key.left, decodeKey(0x1b, '[', 'D'));
+    try std.testing.expectEqual(Key.right, decodeKey(0x1b, '[', 'C'));
     try std.testing.expectEqual(Key.down, decodeKey('j', null, null));
     try std.testing.expectEqual(Key.move_up, decodeKey('K', null, null));
     try std.testing.expectEqual(Key.move_down, decodeKey('J', null, null));
@@ -1818,6 +1867,22 @@ test "input backspace removes one complete utf8 codepoint" {
     try std.testing.expectEqualStrings("Task!", input.value());
 }
 
+test "input cursor inserts and deletes at utf8 codepoint boundaries" {
+    var input = InputState.init(.task_edit, 1, "前後");
+    input.moveLeft();
+    for ("中") |byte| input.append(byte);
+    try std.testing.expectEqualStrings("前中後", input.value());
+    try std.testing.expectEqual("前中".len, input.cursor);
+
+    input.moveLeft();
+    try std.testing.expectEqual("前".len, input.cursor);
+    input.moveRight();
+    try std.testing.expectEqual("前中".len, input.cursor);
+    input.backspace();
+    try std.testing.expectEqualStrings("前後", input.value());
+    try std.testing.expectEqual("前".len, input.cursor);
+}
+
 test "input cursor follows unicode display width and wrapping" {
     const panel: Panel = .{ .top = 1, .left = 1, .width = 10, .height = 12 };
     var position = inputCursorPosition(panel, "あいa");
@@ -1827,6 +1892,18 @@ test "input cursor follows unicode display width and wrapping" {
     position = inputCursorPosition(panel, "あいう");
     try std.testing.expectEqual(@as(u16, 6), position.row);
     try std.testing.expectEqual(@as(u16, 3), position.column);
+}
+
+test "input cursor rendering uses the editing position" {
+    const panel: Panel = .{ .top = 1, .left = 1, .width = 20, .height = 12 };
+    var input = InputState.init(.task_edit, 1, "前後");
+    input.moveLeft();
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+
+    try renderInputCursor(&writer, panel, input);
+
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\x1b[5;5H") != null);
 }
 
 test "input rendering tolerates utf8 arriving one byte at a time" {
@@ -2048,6 +2125,18 @@ test "repository tree renders expanded issues and navigates visible rows" {
     try std.testing.expectEqual(@as(?usize, 0), model.repository_issue_selected);
     moveRepositoryTreeSelection(&config, &tree, &model, false);
     try std.testing.expectEqual(@as(?usize, null), model.repository_issue_selected);
+}
+
+test "right pane rows wrap unicode and keep selected continuation full width" {
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    const panel: Panel = .{ .top = 1, .left = 1, .width = 20, .height = 8 };
+
+    const lines = try renderWrappedRightLine(&writer, 2, panel.bottom(), panel, "  > #12 あいうえおかきくけこさしす", 8, true, false);
+
+    try std.testing.expectEqual(@as(u16, 3), lines);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "        かきくけこ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "        さしす    \x1b[0m") != null);
 }
 
 test "repository toggle reports cached preload failure without fetching again" {

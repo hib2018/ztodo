@@ -105,7 +105,7 @@ ztodo clear
 
 ## TUIを使う
 
-引数なしの`ztodo`はTUIを起動します。左にTasks、右にRepositories / Issuesなどの補助画面、下部に現在使える操作を表示します。登録済みRepositoryのOpen Issueは起動時に読み込まれるため、通常は`Space`ですぐに展開できます。取得に失敗した場合はエラーを表示し、`r`で再取得できます。
+引数なしの`ztodo`はTUIを起動します。左にTasks、右にRepositories / Issuesなどの補助画面、下部に現在使える操作を表示します。長いTask名、Issue名、Proposal候補は各ペイン内で折り返して表示します。登録済みRepositoryのOpen Issueは起動時に読み込まれるため、通常は`Space`ですぐに展開できます。取得に失敗した場合はエラーを表示し、`r`で再取得できます。
 
 共通操作：
 
@@ -113,6 +113,8 @@ ztodo clear
 - `?`：フォーカス中の画面に対応した詳細ヘルプを開く
 - `Esc`：popupまたは編集中の入力をキャンセルする
 - `q`：TasksではTUIを終了し、右ペインでは一つ前へ戻る
+
+タイトルやRepository名の入力popupでは、`←` / `→`でカーソルをUTF-8文字単位に移動できます。文字入力はカーソル位置へ挿入され、Backspaceはカーソル直前の一文字を削除します。
 
 Tasks：
 
