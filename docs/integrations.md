@@ -30,6 +30,7 @@ height = "90%"
 ## GitHub CLI
 
 ztodoはGitHub APIへ直接接続せず、認証とIssue取得を`gh`へ委譲します。
+TUI起動時は登録RepositoryのOpen Issueについて番号、タイトル、Markdown本文を取得し、選択時の本文プレビューへ使用します。`o`では`gh issue view --web`を使って選択Issueをブラウザで開きます。
 
 ```sh
 gh auth login

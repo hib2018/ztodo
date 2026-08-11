@@ -105,14 +105,14 @@ ztodo clear
 
 ## TUIを使う
 
-引数なしの`ztodo`はTUIを起動します。左にTasks、右にRepositories / Issuesなどの補助画面、下部に現在使える操作を表示します。長いTask名、Issue名、Proposal候補は各ペイン内で折り返して表示します。登録済みRepositoryのOpen Issueは起動時に読み込まれるため、通常は`Space`ですぐに展開できます。取得に失敗した場合はエラーを表示し、`r`で再取得できます。
+引数なしの`ztodo`はTUIを起動します。左にTasks、右上にRepositories / Issues、右下に選択IssueのMarkdown本文、下部に現在使える操作を表示します。長いTask名、Issue名、本文、Proposal候補は各ペイン内で折り返します。登録済みRepositoryのOpen Issueと本文は起動時に読み込まれるため、通常は選択と同時に本文を確認できます。取得に失敗した場合はエラーを表示し、`r`で再取得できます。
 
 共通操作：
 
-- `Tab`：Tasksと右ペインのフォーカスを切り替える
+- `Tab`：Tasks、Issueツリー、Issue本文の順にフォーカスを切り替える
 - `?`：フォーカス中の画面に対応した詳細ヘルプを開く
 - `Esc`：popupまたは編集中の入力をキャンセルする
-- `q`：TasksではTUIを終了し、右ペインでは一つ前へ戻る
+- `q`：TasksではTUIを終了し、Issueツリー・本文では一つ前の領域へ戻る
 
 タイトルやRepository名の入力popupでは、`←` / `→`でカーソルをUTF-8文字単位に移動できます。文字入力はカーソル位置へ挿入され、Backspaceはカーソル直前の一文字を削除します。
 
@@ -123,18 +123,25 @@ Tasks：
 - `Space`：完了状態を切り替え
 - `d` / `C`：確認後に一件削除・全削除
 - `K` / `J`：並べ替え
-- `r`：Repositories / Issuesを右ペインに表示
-- `p`：Proposalを右ペインに表示
-- `g`：全RepositoryのOpen Issue一覧を右ペインに表示
-- `P`：プロンプト編集を右ペインに表示
+- `r`：Repositories / Issuesへフォーカスを移す
+- `p`：Proposal popupを開く
+- `g`：全RepositoryのOpen Issue一覧popupを開く
+- `P`：プロンプト編集popupを開く
 
 Repositories / Issues：
 
 - `j` / `k`または`↓` / `↑`：Repositoryまたは展開済みIssueを選択
 - `Space`：Repositoryを開閉し、Issueを直下へ展開
 - `Enter`：選択IssueのAI向けプロンプトをClipboardへコピー
+- `o`：選択Issueをブラウザで開く
 - `r`：選択RepositoryのIssueを再取得
 - `a` / `d`：Repositoryを追加・確認後に削除
+
+Issue本文：
+
+- `j` / `k`または`↓` / `↑`：本文をスクロール
+- `Enter`：表示中IssueのAI向けプロンプトをClipboardへコピー
+- `o`：表示中Issueをブラウザで開く
 
 Proposal：
 
@@ -144,6 +151,6 @@ Proposal：
 - `i`：ClipboardからProposal JSONを取り込む
 - `A`：確認後、ProposalをTaskへ適用する
 
-全Issue一覧では`j` / `k`で選択し、`Enter`でAI向けプロンプトをClipboardへコピーします。プロンプト編集では`e`で`VISUAL`または`EDITOR`を起動します。
+Proposal、全Issue一覧、プロンプト編集、詳細ヘルプはpopupとして表示します。全Issue一覧では`j` / `k`で選択し、`Enter`でAI向けプロンプトをClipboardへコピーし、`o`でブラウザを開きます。プロンプト編集では`e`で`VISUAL`または`EDITOR`を起動します。
 
 削除や承認は確認popupを表示し、小文字の`y`だけで確定します。それ以外の入力はキャンセルとして扱います。
