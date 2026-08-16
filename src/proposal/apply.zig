@@ -26,12 +26,28 @@ fn applyLoaded(
 ) !usize {
     if (proposal.tasks.items.len == 0) return error.EmptyProposal;
 
+    const original_len = data.tasks.items.len;
+    const original_next_id = data.next_id;
+    var tasks_saved = false;
+    errdefer if (!tasks_saved) {
+        while (data.tasks.items.len > original_len) {
+            const added = data.tasks.pop().?;
+            data.freeTask(added);
+        }
+        data.next_id = original_next_id;
+    };
+
     for (proposal.tasks.items) |candidate| {
-        _ = try data.add(candidate.title);
+        _ = try data.addForIssue(candidate.title, .{
+            .repository = proposal.source.repository,
+            .number = proposal.source.issue_number,
+            .title = proposal.source.issue_title,
+        });
     }
 
     try paths.ensureParent(io, tasks_path);
     try store.save(allocator, io, tasks_path, data);
+    tasks_saved = true;
     proposal_store.delete(io, proposal_path) catch return error.ProposalCleanupFailed;
     return proposal.tasks.items.len;
 }
@@ -71,6 +87,8 @@ test "apply adds all candidates with monotonic ids and removes proposal" {
     try std.testing.expectEqualStrings("first", applied.tasks.items[1].title);
     try std.testing.expectEqual(@as(u64, 3), applied.tasks.items[2].id);
     try std.testing.expectEqualStrings("second", applied.tasks.items[2].title);
+    try std.testing.expectEqualStrings("owner/ztodo", applied.tasks.items[1].issue.?.repository);
+    try std.testing.expectEqual(@as(u64, 24), applied.tasks.items[2].issue.?.number);
     try std.testing.expect(!try proposal_store.exists(io, proposal_path));
 }
 
@@ -122,5 +140,7 @@ test "task save failure keeps the proposal" {
         error.WriteFailed,
         applyLoaded(allocator, io, tasks_path, proposal_path, &data, &proposal),
     );
+    try std.testing.expectEqual(@as(usize, 0), data.tasks.items.len);
+    try std.testing.expectEqual(@as(u64, 1), data.next_id);
     try std.testing.expect(try proposal_store.exists(io, proposal_path));
 }

@@ -69,7 +69,7 @@ ztodo prop
 ztodo
 ```
 
-TUIは左のTasks、右上のRepositories / Issues、右下のIssue本文で構成されます。`Tab`でフォーカスを切り替え、現在使える操作は画面下部のHelpで確認できます。詳しくは[基本的な使い方](docs/guide.md#tuiを使う)を参照してください。
+TUIは左のTasks、右上のRepositories / Issues、右下のIssue本文で構成されます。Issueを選ぶと紐づくTaskだけを表示でき、手動追加Taskの紐付けや全Task表示への切り替えもできます。`Tab`でフォーカスを切り替え、現在使える操作は画面下部のHelpで確認できます。詳しくは[基本的な使い方](docs/guide.md#tuiを使う)を参照してください。
 
 ## Documentation
 

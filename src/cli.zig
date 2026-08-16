@@ -235,7 +235,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
                 writeRuntimeError(io, err, id);
                 return 1;
             };
-            defer allocator.free(deleted.title);
+            defer data.freeTask(deleted);
             if (!persist(allocator, io, path, &data)) return 1;
             stdout.interface.print("Deleted task {d}: {s}\n", .{ id, deleted.title }) catch return 1;
         },
@@ -589,7 +589,7 @@ fn editAndApproveAtPaths(
         return .saved;
     }
 
-    try writer.writeAll("\nApprove the following tasks?\n\n");
+    try writer.writeAll("\nApprove the following tasks? Existing tasks will be kept; these tasks will be added and linked to the source Issue.\n\n");
     for (proposal.tasks.items, 1..) |candidate, number| {
         try writer.print("{d}. {s}\n", .{ number, candidate.title });
     }

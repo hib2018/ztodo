@@ -90,7 +90,7 @@ ztodo prop
 - `s`：再表示
 - `q`：編集を終了して承認確認へ進む
 
-承認確認では小文字の`y`だけが全Taskを登録してProposalを削除します。それ以外はTaskへ登録せず、編集済みProposalを保存します。入力が途中で終了した場合、編集内容は保存されません。
+承認確認では小文字の`y`だけが全Task候補を元のIssueへ紐付けて追加し、Proposalを削除します。既存Taskは削除も置換もされません。それ以外はTaskへ登録せず、編集済みProposalを保存します。入力が途中で終了した場合、編集内容は保存されません。
 
 ## 7. Taskを操作する
 
@@ -113,12 +113,16 @@ ztodo clear
 - `?`：フォーカス中の画面に対応した詳細ヘルプを開く
 - `Esc`：popupまたは編集中の入力をキャンセルする
 - `q`：TasksではTUIを終了し、Issueツリー・本文では一つ前の領域へ戻る
+- `Shift+O`：GitHubホームを既定ブラウザで開く
 
 タイトルやRepository名の入力popupでは、`←` / `→`でカーソルをUTF-8文字単位に移動できます。文字入力はカーソル位置へ挿入され、Backspaceはカーソル直前の一文字を削除します。
 
 Tasks：
 
 - `j` / `k`または`↓` / `↑`：Taskを選択
+- `v`：全Task表示と、Issueツリーで選択中のIssueに紐づくTask表示を切り替える
+- `l`：選択TaskをIssueツリーで選択中のIssueへ紐付ける
+- `u`：選択TaskのIssue紐付けを解除する
 - `a` / `e`：追加・編集
 - `Space`：完了状態を切り替え
 - `d` / `C`：確認後に一件削除・全削除
@@ -131,6 +135,7 @@ Tasks：
 Repositories / Issues：
 
 - `j` / `k`または`↓` / `↑`：Repositoryまたは展開済みIssueを選択
+- Issueを選択すると、TasksペインにはそのIssueに紐づくTaskだけを表示する。Repositoryを選択すると全Taskを表示する
 - `Space`：Repositoryを開閉し、Issueを直下へ展開
 - `Enter`：選択IssueのAI向けプロンプトをClipboardへコピー
 - `o`：選択Issueをブラウザで開く

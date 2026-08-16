@@ -5,6 +5,7 @@ pub const schema_version: u32 = 1;
 pub const max_file_size = 16 * 1024 * 1024;
 pub const Task = task_mod.Task;
 pub const Status = task_mod.Status;
+pub const IssueRef = task_mod.IssueRef;
 
 pub const Data = struct {
     allocator: std.mem.Allocator,
@@ -18,20 +19,28 @@ pub const Data = struct {
     pub fn deinit(self: *Data) void {
         for (self.tasks.items) |task| {
             self.allocator.free(task.title);
+            freeIssue(self.allocator, task.issue);
         }
         self.tasks.deinit(self.allocator);
         self.* = undefined;
     }
 
     pub fn add(self: *Data, title_input: []const u8) !*const Task {
+        return self.addForIssue(title_input, null);
+    }
+
+    pub fn addForIssue(self: *Data, title_input: []const u8, issue: ?IssueRef) !*const Task {
         const title = try task_mod.trimmedTitle(title_input);
         const title_copy = try self.allocator.dupe(u8, title);
         errdefer self.allocator.free(title_copy);
+        const issue_copy = try dupeIssue(self.allocator, issue);
+        errdefer freeIssue(self.allocator, issue_copy);
 
         try self.tasks.append(self.allocator, .{
             .id = self.next_id,
             .title = title_copy,
             .status = .todo,
+            .issue = issue_copy,
         });
         self.next_id += 1;
         return &self.tasks.items[self.tasks.items.len - 1];
@@ -65,11 +74,25 @@ pub const Data = struct {
         return true;
     }
 
+    pub fn setIssue(self: *Data, id: u64, issue: ?IssueRef) !bool {
+        const task = self.find(id) orelse return error.TaskNotFound;
+        if (issuesEqual(task.issue, issue)) return false;
+        const replacement = try dupeIssue(self.allocator, issue);
+        freeIssue(self.allocator, task.issue);
+        task.issue = replacement;
+        return true;
+    }
+
     pub fn delete(self: *Data, id: u64) error{TaskNotFound}!Task {
         for (self.tasks.items, 0..) |task, index| {
             if (task.id == id) return self.tasks.orderedRemove(index);
         }
         return error.TaskNotFound;
+    }
+
+    pub fn freeTask(self: *Data, task: Task) void {
+        self.allocator.free(task.title);
+        freeIssue(self.allocator, task.issue);
     }
 
     pub fn move(self: *Data, id: u64, position: usize) error{ TaskNotFound, InvalidTaskPosition }!bool {
@@ -95,6 +118,7 @@ pub const Data = struct {
         const count = self.tasks.items.len;
         for (self.tasks.items) |task| {
             self.allocator.free(task.title);
+            freeIssue(self.allocator, task.issue);
         }
         self.tasks.clearRetainingCapacity();
         self.next_id = 1;
@@ -121,13 +145,38 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Data {
     for (parsed.value.tasks) |task| {
         const title = try allocator.dupe(u8, task.title);
         errdefer allocator.free(title);
+        const issue = try dupeIssue(allocator, task.issue);
+        errdefer freeIssue(allocator, issue);
         try data.tasks.append(allocator, .{
             .id = task.id,
             .title = title,
             .status = task.status,
+            .issue = issue,
         });
     }
     return data;
+}
+
+fn dupeIssue(allocator: std.mem.Allocator, issue: ?IssueRef) !?IssueRef {
+    const value = issue orelse return null;
+    if (value.number == 0) return error.InvalidIssueNumber;
+    const repository = try allocator.dupe(u8, value.repository);
+    errdefer allocator.free(repository);
+    const title = try allocator.dupe(u8, value.title);
+    return .{ .repository = repository, .number = value.number, .title = title };
+}
+
+fn freeIssue(allocator: std.mem.Allocator, issue: ?IssueRef) void {
+    const value = issue orelse return;
+    allocator.free(value.repository);
+    allocator.free(value.title);
+}
+
+fn issuesEqual(a: ?IssueRef, b: ?IssueRef) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return a.?.number == b.?.number and
+        std.mem.eql(u8, a.?.repository, b.?.repository) and
+        std.mem.eql(u8, a.?.title, b.?.title);
 }
 
 pub fn encode(allocator: std.mem.Allocator, data: *const Data) ![]u8 {
@@ -166,7 +215,7 @@ test "task operations preserve monotonic ids and idempotent completion" {
     try std.testing.expectEqual(Status.todo, first.status);
     _ = try data.add("second");
     const deleted = try data.delete(1);
-    defer data.allocator.free(deleted.title);
+    defer data.freeTask(deleted);
     const third = try data.add("third");
     try std.testing.expectEqual(@as(u64, 3), third.id);
     try std.testing.expect(try data.complete(3));
@@ -231,6 +280,24 @@ test "JSON round trip supports unicode quotes statuses and next id" {
     try std.testing.expectEqualStrings("日本語と\"引用符\"", restored.tasks.items[0].title);
     try std.testing.expectEqual(Status.done, restored.tasks.items[0].status);
     try std.testing.expectEqual(Status.todo, restored.tasks.items[1].status);
+}
+
+test "task issue association round trips and legacy tasks remain unassigned" {
+    var data = Data.init(std.testing.allocator);
+    defer data.deinit();
+    _ = try data.addForIssue("linked", .{ .repository = "owner/repo", .number = 12, .title = "Issue" });
+    _ = try data.add("manual");
+    const json = try encode(std.testing.allocator, &data);
+    defer std.testing.allocator.free(json);
+    var restored = try decode(std.testing.allocator, json);
+    defer restored.deinit();
+    try std.testing.expectEqualStrings("owner/repo", restored.tasks.items[0].issue.?.repository);
+    try std.testing.expectEqual(@as(u64, 12), restored.tasks.items[0].issue.?.number);
+    try std.testing.expect(restored.tasks.items[1].issue == null);
+
+    var legacy = try decode(std.testing.allocator, "{\"schema_version\":1,\"next_id\":2,\"tasks\":[{\"id\":1,\"title\":\"legacy\",\"status\":\"todo\"}]}");
+    defer legacy.deinit();
+    try std.testing.expect(legacy.tasks.items[0].issue == null);
 }
 
 test "JSON round trip preserves task order independently of ids" {

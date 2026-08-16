@@ -6,6 +6,7 @@ const proposal_store = @import("../proposal/store.zig");
 const proposal_apply = @import("../proposal/apply.zig");
 const proposal_import = @import("../proposal/clipboard_import.zig");
 const clipboard = @import("../platform/clipboard.zig");
+const browser = @import("../platform/browser.zig");
 const github_config = @import("../integrations/github/config.zig");
 const github_client = @import("../integrations/github/client.zig");
 const github_prompt = @import("../integrations/github/prompt.zig");
@@ -196,6 +197,10 @@ pub const Key = enum {
     open_proposal,
     open_prompt,
     open_browser,
+    open_github_home,
+    toggle_task_view,
+    link_task,
+    unlink_task,
     focus_tasks,
     help,
     accept,
@@ -227,6 +232,7 @@ pub const Model = struct {
     issue_body_scroll: usize = 0,
     quit: bool = false,
     popup: ?Popup = null,
+    show_all_tasks: bool = true,
 
     pub fn update(self: *Model, key: Key, task_count: usize) void {
         switch (key) {
@@ -236,7 +242,7 @@ pub const Model = struct {
             .down, .scroll_next => if (self.selected + 1 < task_count) {
                 self.selected += 1;
             },
-            .left, .right, .move_up, .move_down, .add, .edit, .toggle, .delete, .clear, .switch_screen, .approve, .import_proposal, .open_repositories, .open_issues, .open_proposal, .open_prompt, .open_browser, .focus_tasks, .help, .accept, .backspace => {},
+            .left, .right, .move_up, .move_down, .add, .edit, .toggle, .delete, .clear, .switch_screen, .approve, .import_proposal, .open_repositories, .open_issues, .open_proposal, .open_prompt, .open_browser, .open_github_home, .toggle_task_view, .link_task, .unlink_task, .focus_tasks, .help, .accept, .backspace => {},
             .quit => self.quit = true,
             .other => {},
         }
@@ -297,7 +303,7 @@ fn renderApplication(writer: *std.Io.Writer, data: *const store.Data, proposal: 
     const body_panel: Panel = .{ .top = right_top_height + pane_gap + 1, .left = right_panel.left, .width = right_width, .height = right_bottom_height };
     const help_panel: Panel = .{ .top = main_height + pane_gap + 1, .left = 1, .width = columns, .height = help_height };
     const dimmed = false;
-    try renderBase(writer, data, model, tasks_panel, dimmed);
+    try renderBase(writer, data, config, repository_tree, model, tasks_panel, dimmed);
     try renderRepositoriesBase(writer, config, repository_tree, model, right_panel, dimmed);
     try renderIssueBody(writer, config, repository_tree, model, body_panel, dimmed);
     try renderContextHelp(writer, help_panel, model, dimmed);
@@ -315,27 +321,35 @@ fn renderApplication(writer: *std.Io.Writer, data: *const store.Data, proposal: 
     }
 }
 
-fn renderBase(writer: *std.Io.Writer, data: *const store.Data, model: Model, panel: Panel, dimmed: bool) !void {
+fn renderBase(writer: *std.Io.Writer, data: *const store.Data, config: ?*const github_config.Config, tree: ?*const RepositoryTree, model: Model, panel: Panel, dimmed: bool) !void {
     const style = if (dimmed) "\x1b[2m" else "";
-    try renderPanel(writer, panel, dimmed, model.focus == .tasks, " Tasks ");
+    const heading = if (model.show_all_tasks or selectedRepositoryIssue(config, tree, model) == null) " Tasks: All " else " Tasks: Selected Issue ";
+    try renderPanel(writer, panel, dimmed, model.focus == .tasks, heading);
 
     const task_row = panel.top + 1;
     const available_rows: usize = panel.height -| 2;
-    if (data.tasks.items.len == 0) {
+    const count = visibleTaskCount(data, config, tree, model);
+    if (count == 0) {
         try popupText(writer, task_row, panel.left, "  No tasks.", false, dimmed);
     } else {
         const content_columns: usize = panel.width -| 2;
         const prefix_columns: usize = 12;
         const first_columns = content_columns -| prefix_columns;
         const continuation_columns = first_columns -| 1;
-        const start = visibleStart(data, model.selected, available_rows, first_columns, continuation_columns);
+        const start = visibleStart(data, config, tree, model, available_rows, first_columns, continuation_columns);
         var row = task_row;
-        for (data.tasks.items[start..], start..) |task, index| {
+        var visible_index: usize = 0;
+        for (data.tasks.items, 0..) |task, index| {
+            if (!taskVisible(task, config, tree, model)) continue;
+            if (index < start) {
+                visible_index += 1;
+                continue;
+            }
             if (row >= panel.bottom() - 1) break;
             row += @intCast(try renderTask(
                 writer,
                 task,
-                index == model.selected and model.focus == .tasks,
+                visible_index == model.selected and model.focus == .tasks,
                 style,
                 row,
                 panel.left + 1,
@@ -343,6 +357,7 @@ fn renderBase(writer: *std.Io.Writer, data: *const store.Data, model: Model, pan
                 first_columns,
                 continuation_columns,
             ));
+            visible_index += 1;
         }
     }
 }
@@ -399,7 +414,7 @@ fn renderRepositoriesBase(writer: *std.Io.Writer, config: ?*const github_config.
                 for (current.issues.?.items, 0..) |issue, issue_index| {
                     if (ordinal >= start) {
                         if (row >= panel.bottom()) break :outer;
-                        const selected = index == model.repository_selected and model.repository_issue_selected == issue_index and model.focus == .right;
+                        const selected = issueRowHighlighted(model, index, issue_index);
                         var prefix_buffer: [64]u8 = undefined;
                         const prefix = try std.fmt.bufPrint(&prefix_buffer, "  {s} #{d} ", .{ if (selected) ">" else " ", issue.number });
                         row += try renderRepositoryTreeLine(writer, row, panel, prefix, issue.title, selected, dimmed);
@@ -409,6 +424,11 @@ fn renderRepositoriesBase(writer: *std.Io.Writer, config: ?*const github_config.
             };
         }
     }
+}
+
+fn issueRowHighlighted(model: Model, repository_index: usize, issue_index: usize) bool {
+    const is_selected = repository_index == model.repository_selected and model.repository_issue_selected == issue_index;
+    return is_selected and (model.focus == .right or !model.show_all_tasks);
 }
 
 fn selectedRepositoryIssue(config: ?*const github_config.Config, tree: ?*const RepositoryTree, model: Model) ?github_client.IssueSummary {
@@ -645,7 +665,8 @@ fn renderHelpBase(writer: *std.Io.Writer, model: Model, panel: Panel, dimmed: bo
         " Ctrl-C     入力をキャンセル、通常時は終了する",
         "",
         " タスク: a 追加  e 編集  Space 完了  d 削除  K/J 並べ替え",
-        " Repository: a 追加  d 削除  o ブラウザ",
+        "          v 全件/Issue切替  l Issue紐付け  u 紐付け解除",
+        " Repository: a 追加  d 削除  o Issue  O GitHubホーム",
         " Proposal: p 開く  i 取込  A 承認",
         " Issue本文: j/k スクロール  Enter コピー  o ブラウザ",
     };
@@ -659,17 +680,17 @@ fn renderHelpBase(writer: *std.Io.Writer, model: Model, panel: Panel, dimmed: bo
 fn renderContextHelp(writer: *std.Io.Writer, panel: Panel, model: Model, dimmed: bool) !void {
     try renderPanel(writer, panel, dimmed, false, " Help ");
     const common = if (model.focus == .tasks)
-        " Tab: Issueツリーへ  ?: 詳細ヘルプ  q: 終了  p: Proposal  g: 全Issue  P: プロンプト"
+        " Tab: Issueツリーへ  ?: 詳細ヘルプ  q: 終了  p: Proposal  g: 全Issue  O: GitHubホーム"
     else if (model.focus == .right)
-        " Tab: Issue本文へ  ?: 詳細ヘルプ  q: Tasksへ"
+        " Tab: Issue本文へ  ?: 詳細ヘルプ  O: GitHubホーム  q: Tasksへ"
     else
-        " Tab: Tasksへ  ?: 詳細ヘルプ  q: Issueツリーへ";
+        " Tab: Tasksへ  ?: 詳細ヘルプ  O: GitHubホーム  q: Issueツリーへ";
     const context = if (model.focus == .tasks)
-        " Tasks  j/k: 選択  Space: 完了切替  a: 追加  e: 編集  d: 削除  K/J: 並べ替え"
+        " Tasks  j/k: 選択  v: 全件/Issue  l: 紐付け  u: 解除  Space: 完了"
     else if (model.focus == .body)
         " Issue本文  j/k: スクロール  Enter: プロンプトをコピー  o: ブラウザで開く"
     else switch (model.screen) {
-        .tasks, .repositories => " Repositories  j/k: 選択  Space: 開閉  Enter: プロンプトをコピー  o: ブラウザ  r: 再取得",
+        .tasks, .repositories => " Repositories  j/k: 選択  a: 追加  d: 削除  Space: 開閉  Enter: コピー  o: ブラウザ  r: 再取得",
         .proposal => " Proposal  j/k: 選択  a: 追加  e: 編集  d: 削除  K/J: 並べ替え  i: 取込  A: 承認",
         .issues => " Issues  j/k: 選択  Enter: 選択Issueのプロンプトをコピー",
         .prompt => " Prompt  e: 外部エディタで追加指示を編集",
@@ -679,16 +700,59 @@ fn renderContextHelp(writer: *std.Io.Writer, panel: Panel, model: Model, dimmed:
     try popupTextClipped(writer, panel, panel.top + 2, context, false, dimmed);
 }
 
-fn visibleStart(data: *const store.Data, selected: usize, available_rows: usize, first_columns: usize, continuation_columns: usize) usize {
+fn visibleStart(data: *const store.Data, config: ?*const github_config.Config, tree: ?*const RepositoryTree, model: Model, available_rows: usize, first_columns: usize, continuation_columns: usize) usize {
     var start: usize = 0;
     var used: usize = 0;
-    for (data.tasks.items[0 .. selected + 1]) |task| {
+    var visible_index: usize = 0;
+    var selected_global: usize = 0;
+    for (data.tasks.items, 0..) |task, index| {
+        if (!taskVisible(task, config, tree, model)) continue;
         used += wrappedLineCount(task.title, first_columns, continuation_columns);
+        selected_global = index;
+        if (visible_index == model.selected) break;
+        visible_index += 1;
     }
-    while (used > available_rows and start < selected) : (start += 1) {
-        used -= wrappedLineCount(data.tasks.items[start].title, first_columns, continuation_columns);
+    while (used > available_rows and start < selected_global) : (start += 1) {
+        if (taskVisible(data.tasks.items[start], config, tree, model))
+            used -= wrappedLineCount(data.tasks.items[start].title, first_columns, continuation_columns);
     }
     return start;
+}
+
+fn taskVisible(task: store.Task, config: ?*const github_config.Config, tree: ?*const RepositoryTree, model: Model) bool {
+    if (model.show_all_tasks) return true;
+    const selected = selectedRepositoryIssue(config, tree, model) orelse return true;
+    const issue = task.issue orelse return false;
+    return issue.number == selected.number and std.mem.eql(u8, issue.repository, selected.repository);
+}
+
+fn visibleTaskCount(data: *const store.Data, config: ?*const github_config.Config, tree: ?*const RepositoryTree, model: Model) usize {
+    var count: usize = 0;
+    for (data.tasks.items) |task| if (taskVisible(task, config, tree, model)) {
+        count += 1;
+    };
+    return count;
+}
+
+fn visibleTaskDataIndex(data: *const store.Data, config: ?*const github_config.Config, tree: ?*const RepositoryTree, model: Model) ?usize {
+    var visible_index: usize = 0;
+    for (data.tasks.items, 0..) |task, index| {
+        if (!taskVisible(task, config, tree, model)) continue;
+        if (visible_index == model.selected) return index;
+        visible_index += 1;
+    }
+    return null;
+}
+
+fn visibleDataIndexAt(data: *const store.Data, config: ?*const github_config.Config, tree: ?*const RepositoryTree, model: Model, target: usize) ?usize {
+    var copy = model;
+    copy.selected = target;
+    return visibleTaskDataIndex(data, config, tree, copy);
+}
+
+fn normalizeTaskSelection(data: *const store.Data, config: ?*const github_config.Config, tree: ?*const RepositoryTree, model: *Model) void {
+    const count = visibleTaskCount(data, config, tree, model.*);
+    if (count == 0) model.selected = 0 else if (model.selected >= count) model.selected = count - 1;
 }
 
 fn renderTask(
@@ -905,6 +969,7 @@ fn renderPopup(writer: *std.Io.Writer, popup: Popup, screen: Screen, focus: Focu
                 " k / ↑ : Issue本文を上へスクロール",
                 " Enter : 選択IssueのAI向けプロンプトをClipboardへコピー",
                 " o     : 選択Issueをブラウザで開く",
+                " O     : GitHubホームをブラウザで開く",
                 " Tab   : Tasksへフォーカスを移す",
                 " q     : Issueツリーへフォーカスを戻す",
             } else switch (screen) {
@@ -914,6 +979,9 @@ fn renderPopup(writer: *std.Io.Writer, popup: Popup, screen: Screen, focus: Focu
                     " a     : Taskを追加",
                     " e     : Taskを編集",
                     " Space : 完了状態を切り替え",
+                    " v     : 全Taskと選択IssueのTaskを切り替え",
+                    " l     : 選択Taskを選択中のIssueへ紐付け",
+                    " u     : 選択TaskのIssue紐付けを解除",
                     " d     : Taskを削除",
                     " C     : 全Taskを削除",
                     " K / J : Taskを並べ替え",
@@ -921,6 +989,7 @@ fn renderPopup(writer: *std.Io.Writer, popup: Popup, screen: Screen, focus: Focu
                     " P     : プロンプト編集を開く",
                     " r     : Repositoriesを開く",
                     " g     : GitHub Issuesを開く",
+                    " O     : GitHubホームをブラウザで開く",
                     " q     : 終了",
                 },
                 .proposal => &.{
@@ -937,9 +1006,11 @@ fn renderPopup(writer: *std.Io.Writer, popup: Popup, screen: Screen, focus: Focu
                 .repositories => &.{
                     " j / ↓ : 次のRepositoryまたはIssueを選択",
                     " k / ↑ : 前のRepositoryまたはIssueを選択",
+                    "       : Issue選択時は左に紐付くTaskだけを表示",
                     " Space : 選択RepositoryのIssueを展開・折りたたみ",
                     " Enter : 選択IssueのAI向けプロンプトをClipboardへコピー",
                     " o     : 選択Issueをブラウザで開く",
+                    " O     : GitHubホームをブラウザで開く",
                     " r     : 選択RepositoryのOpen Issueを再取得",
                     " a     : Repositoryを一覧へ追加",
                     " d     : 選択Repositoryを確認後に削除",
@@ -951,6 +1022,7 @@ fn renderPopup(writer: *std.Io.Writer, popup: Popup, screen: Screen, focus: Focu
                     " k / ↑ : 前のIssue",
                     " Enter : プロンプトをコピー",
                     " o     : 選択Issueをブラウザで開く",
+                    " O     : GitHubホームをブラウザで開く",
                     " q     : Tasksへ戻る",
                 },
                 .prompt => &.{
@@ -983,7 +1055,7 @@ fn renderPopup(writer: *std.Io.Writer, popup: Popup, screen: Screen, focus: Focu
                 const message = try std.fmt.bufPrint(&message_buffer, " ProposalのTask候補 {d}を削除します。", .{index + 1});
                 try renderPopupWrapped(writer, panel, panel.top + 3, message);
             },
-            .approve_proposal => try renderPopupWrapped(writer, panel, panel.top + 3, " Proposalの全Task候補をTask一覧へ登録します。"),
+            .approve_proposal => try renderPopupWrapped(writer, panel, panel.top + 3, " Proposalの全Task候補を元Issueへ紐付けて追加します。既存Taskは削除・置換しません。"),
             .delete_repository => |index| {
                 var message_buffer: [128]u8 = undefined;
                 const message = try std.fmt.bufPrint(&message_buffer, " Repository {d}を設定から削除します。", .{index + 1});
@@ -1128,6 +1200,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
     try preloadRepositoryIssues(allocator, io, if (config) |*value| value else null, &repository_tree);
     while (!model.quit) {
         const size = terminalSize(io, stdout);
+        normalizeTaskSelection(data, if (config) |*value| value else null, &repository_tree, &model);
         try renderApplication(&out.interface, data, if (proposal) |*value| value else null, if (config) |*value| value else null, if (issues) |*value| value else null, &repository_tree, instructions, model, size.columns, size.rows);
         try out.interface.flush();
         const event = readInputEvent(&input.interface) catch |err| switch (err) {
@@ -1142,6 +1215,12 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
             .key => |key| key,
             .byte => |byte| commandKey(byte),
         };
+        if (key == .open_github_home) {
+            browser.open(allocator, io, "https://github.com/") catch |err| {
+                model.popup = .{ .error_message = browserErrorMessage(err) };
+            };
+            continue;
+        }
         if (key == .switch_screen) {
             if (model.screen != .repositories and model.screen != .tasks) continue;
             model.focus = switch (model.focus) {
@@ -1226,46 +1305,52 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
             }
             continue;
         }
+        const selected_index = visibleTaskDataIndex(data, if (config) |*value| value else null, &repository_tree, model);
+        const visible_count = visibleTaskCount(data, if (config) |*value| value else null, &repository_tree, model);
         switch (key) {
-            .move_up => if (model.selected > 0) {
-                const id = data.tasks.items[model.selected].id;
-                const original_position = model.selected + 1;
-                _ = try data.move(id, model.selected);
+            .move_up => if (model.selected > 0 and selected_index != null) {
+                const previous_index = visibleDataIndexAt(data, if (config) |*value| value else null, &repository_tree, model, model.selected - 1).?;
+                std.mem.swap(store.Task, &data.tasks.items[selected_index.?], &data.tasks.items[previous_index]);
                 if (!persist(allocator, io, path, data)) {
-                    _ = data.move(id, original_position) catch {};
+                    std.mem.swap(store.Task, &data.tasks.items[selected_index.?], &data.tasks.items[previous_index]);
                     model.popup = .{ .error_message = "Taskの順序を保存できませんでした。" };
                 } else {
                     model.selected -= 1;
                 }
             },
-            .move_down => if (model.selected + 1 < data.tasks.items.len) {
-                const id = data.tasks.items[model.selected].id;
-                const original_position = model.selected + 1;
-                _ = try data.move(id, model.selected + 2);
+            .move_down => if (model.selected + 1 < visible_count and selected_index != null) {
+                const next_index = visibleDataIndexAt(data, if (config) |*value| value else null, &repository_tree, model, model.selected + 1).?;
+                std.mem.swap(store.Task, &data.tasks.items[selected_index.?], &data.tasks.items[next_index]);
                 if (!persist(allocator, io, path, data)) {
-                    _ = data.move(id, original_position) catch {};
+                    std.mem.swap(store.Task, &data.tasks.items[selected_index.?], &data.tasks.items[next_index]);
                     model.popup = .{ .error_message = "Taskの順序を保存できませんでした。" };
                 } else {
                     model.selected += 1;
                 }
             },
             .add => model.popup = .{ .input = InputState.init(.task_add, null, "") },
-            .edit => if (data.tasks.items.len > 0) {
-                const task = data.tasks.items[model.selected];
+            .edit => if (selected_index) |index| {
+                const task = data.tasks.items[index];
                 model.popup = .{ .input = InputState.init(.task_edit, task.id, task.title) };
             },
-            .toggle => if (data.tasks.items.len > 0) try toggleSelected(allocator, io, path, data, &model),
-            .delete => if (data.tasks.items.len > 0) {
+            .toggle => if (selected_index) |index| try toggleTaskAt(allocator, io, path, data, &model, index),
+            .delete => if (selected_index) |index| {
                 model.popup = .{ .confirmation = .{ .delete_task = .{
-                    .id = data.tasks.items[model.selected].id,
-                    .index = model.selected,
+                    .id = data.tasks.items[index].id,
+                    .index = index,
                 } } };
             },
+            .toggle_task_view => {
+                model.show_all_tasks = !model.show_all_tasks;
+                model.selected = 0;
+            },
+            .link_task => if (selected_index) |index| try setTaskIssue(allocator, io, path, data, &model, index, selectedRepositoryIssue(if (config) |*value| value else null, &repository_tree, model)),
+            .unlink_task => if (selected_index) |index| try setTaskIssue(allocator, io, path, data, &model, index, null),
             .clear => if (data.tasks.items.len > 0) {
                 model.popup = .{ .confirmation = .clear_tasks };
             },
             .help => model.popup = .help,
-            else => model.update(key, data.tasks.items.len),
+            else => model.update(key, visible_count),
         }
     }
 }
@@ -1292,6 +1377,10 @@ fn commandKey(byte: u8) Key {
         'r' => .open_repositories,
         'g' => .open_issues,
         'o' => .open_browser,
+        'O' => .open_github_home,
+        'v' => .toggle_task_view,
+        'l' => .link_task,
+        'u' => .unlink_task,
         else => .other,
     };
 }
@@ -1444,6 +1533,8 @@ fn moveRepositoryTreeSelection(
             model.repository_selected += 1;
         }
         model.issue_body_scroll = 0;
+        model.show_all_tasks = model.repository_issue_selected == null;
+        model.selected = 0;
         return;
     }
 
@@ -1455,6 +1546,8 @@ fn moveRepositoryTreeSelection(
         model.repository_issue_selected = if (previous_count == 0) null else previous_count - 1;
     }
     model.issue_body_scroll = 0;
+    model.show_all_tasks = model.repository_issue_selected == null;
+    model.selected = 0;
 }
 
 fn copySelectedRepositoryIssuePrompt(allocator: std.mem.Allocator, io: std.Io, config: *const ?github_config.Config, tree: *RepositoryTree, instructions: []const u8, model: *Model) !void {
@@ -1562,6 +1655,14 @@ fn githubIssueErrorMessage(err: anyerror) []const u8 {
         error.InvalidGitHubOutput => " GitHub CLIから不正なIssueデータが返されました。",
         error.TooManyGitHubIssues => " Open Issueが多すぎます。",
         else => " GitHub Issueを取得できませんでした。",
+    };
+}
+
+fn browserErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.BrowserCommandNotFound => " ブラウザを開くコマンドが見つかりません。",
+        error.UnsupportedBrowser => " このOSではブラウザを開けません。",
+        else => " GitHubホームをブラウザで開けませんでした。",
     };
 }
 
@@ -1703,10 +1804,11 @@ fn applyInput(
             const id = task.id;
             if (!persist(allocator, io, path, data)) {
                 const removed = data.delete(id) catch unreachable;
-                allocator.free(removed.title);
+                data.freeTask(removed);
                 model.popup = .{ .error_message = " Taskを保存できませんでした。" };
                 return;
             }
+            model.show_all_tasks = true;
             model.selected = data.tasks.items.len - 1;
             model.popup = null;
         },
@@ -1804,12 +1906,41 @@ fn reloadConfig(allocator: std.mem.Allocator, io: std.Io, config_path: []const u
     config.* = loaded;
 }
 
-fn toggleSelected(allocator: std.mem.Allocator, io: std.Io, path: []const u8, data: *store.Data, model: *Model) !void {
-    const id = data.tasks.items[model.selected].id;
+fn toggleTaskAt(allocator: std.mem.Allocator, io: std.Io, path: []const u8, data: *store.Data, model: *Model, index: usize) !void {
+    const id = data.tasks.items[index].id;
     _ = try data.toggle(id);
     if (!persist(allocator, io, path, data)) {
         _ = data.toggle(id) catch {};
         model.popup = .{ .error_message = " 完了状態を保存できませんでした。" };
+        return;
+    }
+    model.popup = null;
+}
+
+fn setTaskIssue(allocator: std.mem.Allocator, io: std.Io, path: []const u8, data: *store.Data, model: *Model, index: usize, selected: ?github_client.IssueSummary) !void {
+    const task = data.tasks.items[index];
+    const previous_repository = if (task.issue) |issue| try allocator.dupe(u8, issue.repository) else null;
+    defer if (previous_repository) |value| allocator.free(value);
+    const previous_title = if (task.issue) |issue| try allocator.dupe(u8, issue.title) else null;
+    defer if (previous_title) |value| allocator.free(value);
+    const previous: ?store.IssueRef = if (task.issue) |issue| .{
+        .repository = previous_repository.?,
+        .number = issue.number,
+        .title = previous_title.?,
+    } else null;
+    const replacement: ?store.IssueRef = if (selected) |issue| .{
+        .repository = issue.repository,
+        .number = issue.number,
+        .title = issue.title,
+    } else null;
+    const changed = data.setIssue(task.id, replacement) catch {
+        model.popup = .{ .error_message = " TaskをIssueへ紐付けできませんでした。" };
+        return;
+    };
+    if (!changed) return;
+    if (!persist(allocator, io, path, data)) {
+        _ = data.setIssue(task.id, previous) catch {};
+        model.popup = .{ .error_message = " TaskのIssue紐付けを保存できませんでした。" };
         return;
     }
     model.popup = null;
@@ -1838,7 +1969,7 @@ fn applyConfirmation(
                 model.popup = .{ .error_message = " Taskの削除を保存できませんでした。" };
                 return;
             }
-            allocator.free(deleted.title);
+            data.freeTask(deleted);
             if (data.tasks.items.len == 0) {
                 model.selected = 0;
             } else if (model.selected >= data.tasks.items.len) {
@@ -1999,6 +2130,20 @@ test "tasks issue panes and prompt popup render with contextual help" {
     try std.testing.expect(std.mem.indexOf(u8, output, " Issue Body ") != null);
 }
 
+test "repository context help shows add and delete keys" {
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try renderContextHelp(
+        &writer,
+        .{ .top = 1, .left = 1, .width = 100, .height = 4 },
+        .{ .screen = .repositories, .focus = .right },
+        false,
+    );
+    const output = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "a: 追加") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "d: 削除") != null);
+}
+
 test "key decoder supports arrows vim keys and interrupt" {
     try std.testing.expectEqual(Key.up, decodeKey(0x1b, '[', 'A'));
     try std.testing.expectEqual(Key.down, decodeKey(0x1b, '[', 'B'));
@@ -2011,6 +2156,7 @@ test "key decoder supports arrows vim keys and interrupt" {
     try std.testing.expectEqual(Key.accept, decodeKey('\r', null, null));
     try std.testing.expectEqual(Key.quit, decodeKey(3, null, null));
     try std.testing.expectEqual(Key.open_browser, commandKey('o'));
+    try std.testing.expectEqual(Key.open_github_home, commandKey('O'));
 }
 
 test "issue body scrolling preserves markdown and sanitizes terminal controls" {
@@ -2165,7 +2311,7 @@ test "tui task operations persist through the shared store" {
     try std.testing.expectEqualStrings("updated", data.tasks.items[0].title);
     try std.testing.expectEqual(@as(?Popup, null), model.popup);
 
-    try toggleSelected(allocator, io, path, &data, &model);
+    try toggleTaskAt(allocator, io, path, &data, &model, 0);
     try std.testing.expectEqual(store.Status.done, data.tasks.items[0].status);
     try std.testing.expectEqual(@as(?Popup, null), model.popup);
 
@@ -2190,6 +2336,68 @@ test "tui task operations persist through the shared store" {
     try std.testing.expectEqual(@as(?Popup, null), model.popup);
 }
 
+test "selected issue filters tasks and manual association persists" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "tasks.json" });
+    defer allocator.free(path);
+
+    var data = store.Data.init(allocator);
+    defer data.deinit();
+    _ = try data.add("manual");
+    _ = try data.addForIssue("other", .{ .repository = "owner/repo", .number = 99, .title = "Other" });
+
+    var repositories = [_][]const u8{"owner/repo"};
+    const config = github_config.Config{ .allocator = allocator, .repositories = &repositories };
+    var tree = RepositoryTree.init(allocator);
+    defer tree.deinit();
+    const node = try tree.getOrCreate("owner/repo");
+    const items = try allocator.alloc(github_client.IssueSummary, 1);
+    items[0] = .{
+        .repository = try allocator.dupe(u8, "owner/repo"),
+        .number = 12,
+        .title = try allocator.dupe(u8, "Selected"),
+        .body = try allocator.dupe(u8, ""),
+    };
+    node.issues = .{ .allocator = allocator, .items = items };
+    node.expanded = true;
+    var model: Model = .{ .repository_issue_selected = 0, .show_all_tasks = false };
+
+    try std.testing.expectEqual(@as(usize, 0), visibleTaskCount(&data, &config, &tree, model));
+    model.show_all_tasks = true;
+    try setTaskIssue(allocator, io, path, &data, &model, 0, items[0]);
+    model.show_all_tasks = false;
+    try std.testing.expectEqual(@as(usize, 1), visibleTaskCount(&data, &config, &tree, model));
+    try std.testing.expectEqual(@as(?usize, 0), visibleTaskDataIndex(&data, &config, &tree, model));
+
+    var loaded = try store.load(allocator, io, path);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u64, 12), loaded.tasks.items[0].issue.?.number);
+}
+
+test "selected issue row stays highlighted while its tasks are displayed" {
+    try std.testing.expect(issueRowHighlighted(.{
+        .focus = .tasks,
+        .repository_selected = 1,
+        .repository_issue_selected = 2,
+        .show_all_tasks = false,
+    }, 1, 2));
+    try std.testing.expect(!issueRowHighlighted(.{
+        .focus = .tasks,
+        .repository_selected = 1,
+        .repository_issue_selected = 2,
+        .show_all_tasks = true,
+    }, 1, 2));
+    try std.testing.expect(issueRowHighlighted(.{
+        .focus = .right,
+        .repository_selected = 1,
+        .repository_issue_selected = 2,
+        .show_all_tasks = true,
+    }, 1, 2));
+}
+
 test "tui proposal operations persist and approval adds tasks" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2204,6 +2412,8 @@ test "tui proposal operations persist and approval adds tasks" {
 
     var data = store.Data.init(allocator);
     defer data.deinit();
+    _ = try data.add("existing");
+    try store.save(allocator, io, path, &data);
     const json =
         \\{"source":{"provider":"github","repository":"owner/ztodo","issue_number":24,"issue_title":"TUI"},"summary":"概要","completion_criteria":[],"tasks":[{"title":"first"}],"excluded":[],"notes":[]}
     ;
@@ -2232,9 +2442,12 @@ test "tui proposal operations persist and approval adds tasks" {
     try applyConfirmation(allocator, io, path, proposal_path, config_path, &data, &proposal, &config, &model, .approve_proposal);
     try std.testing.expect(proposal == null);
     try std.testing.expectEqual(Screen.repositories, model.screen);
-    try std.testing.expectEqual(@as(usize, 2), data.tasks.items.len);
-    try std.testing.expectEqualStrings("updated", data.tasks.items[0].title);
-    try std.testing.expectEqualStrings("first", data.tasks.items[1].title);
+    try std.testing.expectEqual(@as(usize, 3), data.tasks.items.len);
+    try std.testing.expectEqualStrings("existing", data.tasks.items[0].title);
+    try std.testing.expect(data.tasks.items[0].issue == null);
+    try std.testing.expectEqualStrings("updated", data.tasks.items[1].title);
+    try std.testing.expectEqual(@as(u64, 24), data.tasks.items[1].issue.?.number);
+    try std.testing.expectEqualStrings("first", data.tasks.items[2].title);
     try std.testing.expect(!try proposal_store.exists(io, proposal_path));
 }
 

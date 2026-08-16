@@ -13,6 +13,7 @@ pub const ai_prompt = @import("integrations/github/prompt.zig");
 pub const prompt_instructions = @import("integrations/github/prompt_instructions.zig");
 pub const prompt_editor = @import("integrations/github/prompt_editor.zig");
 pub const clipboard = @import("platform/clipboard.zig");
+pub const browser = @import("platform/browser.zig");
 pub const workflow_clipboard_import = @import("proposal/clipboard_import.zig");
 pub const tui = @import("tui/app.zig");
 pub const cli = @import("cli.zig");
@@ -33,6 +34,7 @@ test {
     _ = prompt_instructions;
     _ = prompt_editor;
     _ = clipboard;
+    _ = browser;
     _ = workflow_clipboard_import;
     _ = tui;
     _ = cli;
