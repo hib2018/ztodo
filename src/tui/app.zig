@@ -15,7 +15,7 @@ const prompt_editor = @import("../integrations/github/prompt_editor.zig");
 const build_options = @import("build_options");
 
 pub const min_columns: u16 = 48;
-pub const min_rows: u16 = 12;
+pub const min_rows: u16 = 20;
 
 const panel_style = "\x1b[39m\x1b[49m";
 const panel_heading_style = "\x1b[1;39m\x1b[49m";
@@ -99,9 +99,62 @@ const Confirmation = union(enum) {
 };
 
 const Screen = enum { tasks, proposal, repositories, issues, prompt, help };
-const Focus = enum { tasks, right, body };
+const Focus = enum { tasks, right, body, activity };
 const pane_gap: u16 = 1;
 const help_height: u16 = 4;
+const activity_height: u16 = 4;
+const activity_focused_height: u16 = 8;
+const max_activity_entries = 32;
+const max_activity_text_bytes = 256;
+
+const ActivityText = struct {
+    buffer: [max_activity_text_bytes]u8 = undefined,
+    len: usize = 0,
+
+    fn set(self: *ActivityText, text: []const u8) void {
+        self.len = 0;
+        var offset: usize = 0;
+        while (offset < text.len and self.len < self.buffer.len) {
+            const unit = displayUnit(text[offset..]);
+            if (self.len + unit.length > self.buffer.len) break;
+            if (unit.length == 1 and (text[offset] < 0x20 or text[offset] == 0x7f)) {
+                self.buffer[self.len] = ' ';
+            } else {
+                @memcpy(self.buffer[self.len .. self.len + unit.length], text[offset .. offset + unit.length]);
+            }
+            self.len += unit.length;
+            offset += unit.length;
+        }
+    }
+
+    fn value(self: *const ActivityText) []const u8 {
+        return self.buffer[0..self.len];
+    }
+};
+
+const ActivityEntry = struct {
+    command: ActivityText = .{},
+    response: ActivityText = .{},
+    success: bool = true,
+};
+
+const ActivityLog = struct {
+    entries: [max_activity_entries]ActivityEntry = [_]ActivityEntry{.{}} ** max_activity_entries,
+    count: usize = 0,
+    scroll: usize = 0,
+
+    fn add(self: *ActivityLog, command: []const u8, response: []const u8, success: bool) void {
+        if (self.count == self.entries.len) {
+            std.mem.copyForwards(ActivityEntry, self.entries[0 .. self.entries.len - 1], self.entries[1..]);
+            self.count -= 1;
+        }
+        self.entries[self.count] = .{ .success = success };
+        self.entries[self.count].command.set(command);
+        self.entries[self.count].response.set(response);
+        self.count += 1;
+        self.scroll = 0;
+    }
+};
 
 const RepositoryNode = struct {
     repository: []u8,
@@ -162,16 +215,18 @@ const RepositoryTree = struct {
     }
 };
 
-fn preloadRepositoryIssues(allocator: std.mem.Allocator, io: std.Io, config: ?*const github_config.Config, tree: *RepositoryTree) !void {
+fn preloadRepositoryIssues(allocator: std.mem.Allocator, io: std.Io, config: ?*const github_config.Config, tree: *RepositoryTree, model: *Model) !void {
     const current = config orelse return;
     for (current.repositories) |repository| {
         const node = try tree.getOrCreate(repository);
         node.load_attempted = true;
         node.issues = github_client.listOpen(allocator, io, repository) catch |err| {
             node.load_error = githubIssueErrorMessage(err);
+            model.activity.add("> Load repository Issues", githubIssueErrorMessage(err), false);
             continue;
         };
         node.load_error = null;
+        model.activity.add("> Load repository Issues", "Loaded", true);
     }
 }
 
@@ -233,6 +288,7 @@ pub const Model = struct {
     quit: bool = false,
     popup: ?Popup = null,
     show_all_tasks: bool = true,
+    activity: ActivityLog = .{},
 
     pub fn update(self: *Model, key: Key, task_count: usize) void {
         switch (key) {
@@ -296,7 +352,9 @@ fn renderApplication(writer: *std.Io.Writer, data: *const store.Data, proposal: 
     const available_columns = columns - pane_gap;
     const tasks_width = (available_columns * 3) / 5;
     const right_width = available_columns - tasks_width;
-    const tasks_panel: Panel = .{ .top = 1, .left = 1, .width = tasks_width, .height = main_height };
+    const current_activity_height = if (model.focus == .activity) activity_focused_height else activity_height;
+    const tasks_panel: Panel = .{ .top = 1, .left = 1, .width = tasks_width, .height = main_height - pane_gap - current_activity_height };
+    const activity_panel: Panel = .{ .top = tasks_panel.bottom() + pane_gap + 1, .left = 1, .width = tasks_width, .height = current_activity_height };
     const right_top_height = (main_height - pane_gap) * 45 / 100;
     const right_bottom_height = main_height - pane_gap - right_top_height;
     const right_panel: Panel = .{ .top = 1, .left = tasks_width + pane_gap + 1, .width = right_width, .height = right_top_height };
@@ -304,6 +362,7 @@ fn renderApplication(writer: *std.Io.Writer, data: *const store.Data, proposal: 
     const help_panel: Panel = .{ .top = main_height + pane_gap + 1, .left = 1, .width = columns, .height = help_height };
     const dimmed = false;
     try renderBase(writer, data, config, repository_tree, model, tasks_panel, dimmed);
+    try renderActivity(writer, model, activity_panel, dimmed);
     try renderRepositoriesBase(writer, config, repository_tree, model, right_panel, dimmed);
     try renderIssueBody(writer, config, repository_tree, model, body_panel, dimmed);
     try renderContextHelp(writer, help_panel, model, dimmed);
@@ -318,6 +377,28 @@ fn renderApplication(writer: *std.Io.Writer, data: *const store.Data, proposal: 
         .prompt => try renderScreenPopup(writer, .prompt, proposal, issues, instructions, model, columns, rows),
         .help => try renderScreenPopup(writer, .help, proposal, issues, instructions, model, columns, rows),
         .tasks, .repositories => try writer.writeAll("\x1b[?25l"),
+    }
+}
+
+fn renderActivity(writer: *std.Io.Writer, model: Model, panel: Panel, dimmed: bool) !void {
+    try renderPanel(writer, panel, dimmed, model.focus == .activity, " Activity ");
+    if (model.activity.count == 0) {
+        try popupTextClipped(writer, panel, panel.top + 1, " No activity yet.", false, dimmed);
+        return;
+    }
+
+    const visible_entries: usize = @max(@as(usize, 1), (panel.height -| 2) / 2);
+    const end = model.activity.count - @min(model.activity.scroll, model.activity.count - 1);
+    const start = end - @min(visible_entries, end);
+    var row = panel.top + 1;
+    for (model.activity.entries[start..end]) |entry| {
+        try popupTextClipped(writer, panel, row, entry.command.value(), false, dimmed);
+        row += 1;
+        if (row >= panel.bottom()) break;
+        var response_buffer: [max_activity_text_bytes + 4]u8 = undefined;
+        const response = try std.fmt.bufPrint(&response_buffer, "{s} {s}", .{ if (entry.success) "✓" else "✗", entry.response.value() });
+        try popupTextClipped(writer, panel, row, response, entry.success, dimmed);
+        row += 1;
     }
 }
 
@@ -657,7 +738,7 @@ fn renderHelpBase(writer: *std.Io.Writer, model: Model, panel: Panel, dimmed: bo
     try renderPaneHeading(writer, panel, " ヘルプ", dimmed, model.focus == .right);
     try popupLine(writer, panel.top + 2, panel.left, panel.width, "├", "─", "┤", paneFrameStyle(dimmed, model.focus == .right));
     const lines = [_][]const u8{
-        " Tab       Tasks、Issueツリー、Issue本文を順に切り替える",
+        " Tab       Tasks、Issueツリー、Issue本文、Activityを切り替える",
         " j / ↓     次の項目を選択する",
         " k / ↑     前の項目を選択する",
         " Enter      選択IssueのAI向けプロンプトをコピーする",
@@ -683,9 +764,13 @@ fn renderContextHelp(writer: *std.Io.Writer, panel: Panel, model: Model, dimmed:
         " Tab: Issueツリーへ  ?: 詳細ヘルプ  q: 終了  p: Proposal  g: 全Issue  O: GitHubホーム"
     else if (model.focus == .right)
         " Tab: Issue本文へ  ?: 詳細ヘルプ  O: GitHubホーム  q: Tasksへ"
+    else if (model.focus == .body)
+        " Tab: Activityへ  ?: 詳細ヘルプ  O: GitHubホーム  q: Issueツリーへ"
     else
-        " Tab: Tasksへ  ?: 詳細ヘルプ  O: GitHubホーム  q: Issueツリーへ";
-    const context = if (model.focus == .tasks)
+        " Tab: Tasksへ  ?: 詳細ヘルプ  q: Tasksへ";
+    const context = if (model.focus == .activity)
+        " Activity  j/k: 履歴をスクロール（セッション内の直近32件）"
+    else if (model.focus == .tasks)
         " Tasks  j/k: 選択  v: 全件/Issue  l: 紐付け  u: 解除  Space: 完了"
     else if (model.focus == .body)
         " Issue本文  j/k: スクロール  Enter: プロンプトをコピー  o: ブラウザで開く"
@@ -964,7 +1049,14 @@ fn renderPopup(writer: *std.Io.Writer, popup: Popup, screen: Screen, focus: Focu
     try popupText(writer, panel.top + 1, panel.left, heading, true, false);
     switch (popup) {
         .help => {
-            const lines: []const []const u8 = if (focus == .body) &.{
+            const lines: []const []const u8 = if (focus == .activity) &.{
+                " j / ↓ : 新しいActivityへスクロール",
+                " k / ↑ : 古いActivityへスクロール",
+                " Tab   : Tasksへフォーカスを移す",
+                " q     : Tasksへフォーカスを戻す",
+                "",
+                " 履歴はTUI終了時に破棄されます。",
+            } else if (focus == .body) &.{
                 " j / ↓ : Issue本文を下へスクロール",
                 " k / ↑ : Issue本文を上へスクロール",
                 " Enter : 選択IssueのAI向けプロンプトをClipboardへコピー",
@@ -990,6 +1082,7 @@ fn renderPopup(writer: *std.Io.Writer, popup: Popup, screen: Screen, focus: Focu
                     " r     : Repositoriesを開く",
                     " g     : GitHub Issuesを開く",
                     " O     : GitHubホームをブラウザで開く",
+                    " Tab   : Issueツリー、Issue本文、Activityへ移動",
                     " q     : 終了",
                 },
                 .proposal => &.{
@@ -1197,7 +1290,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
     defer if (issues) |*value| value.deinit();
     var repository_tree = RepositoryTree.init(allocator);
     defer repository_tree.deinit();
-    try preloadRepositoryIssues(allocator, io, if (config) |*value| value else null, &repository_tree);
+    try preloadRepositoryIssues(allocator, io, if (config) |*value| value else null, &repository_tree, &model);
     while (!model.quit) {
         const size = terminalSize(io, stdout);
         normalizeTaskSelection(data, if (config) |*value| value else null, &repository_tree, &model);
@@ -1217,8 +1310,11 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
         };
         if (key == .open_github_home) {
             browser.open(allocator, io, "https://github.com/") catch |err| {
+                model.activity.add("> Open GitHub home", browserErrorMessage(err), false);
                 model.popup = .{ .error_message = browserErrorMessage(err) };
+                continue;
             };
+            model.activity.add("> Open GitHub home", "Opened in browser", true);
             continue;
         }
         if (key == .switch_screen) {
@@ -1226,7 +1322,8 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
             model.focus = switch (model.focus) {
                 .tasks => .right,
                 .right => .body,
-                .body => .tasks,
+                .body => .activity,
+                .activity => .tasks,
             };
             continue;
         }
@@ -1275,8 +1372,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
                             };
                             allocator.free(instructions);
                             instructions = refreshed;
+                            model.activity.add("> Edit prompt instructions", "Saved", true);
                         } else |err| {
                             model.popup = .{ .error_message = promptEditorErrorMessage(err) };
+                            model.activity.add("> Edit prompt instructions", promptEditorErrorMessage(err), false);
                         }
                     } else if (key == .quit) model.screen = .repositories else if (key == .help) model.popup = .help;
                 },
@@ -1305,6 +1404,20 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
             }
             continue;
         }
+        if (model.focus == .activity) {
+            switch (key) {
+                .up, .scroll_previous => if (model.activity.scroll + 1 < model.activity.count) {
+                    model.activity.scroll += 1;
+                },
+                .down, .scroll_next => if (model.activity.scroll > 0) {
+                    model.activity.scroll -= 1;
+                },
+                .help => model.popup = .help,
+                .quit => model.focus = .tasks,
+                else => {},
+            }
+            continue;
+        }
         const selected_index = visibleTaskDataIndex(data, if (config) |*value| value else null, &repository_tree, model);
         const visible_count = visibleTaskCount(data, if (config) |*value| value else null, &repository_tree, model);
         switch (key) {
@@ -1314,8 +1427,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
                 if (!persist(allocator, io, path, data)) {
                     std.mem.swap(store.Task, &data.tasks.items[selected_index.?], &data.tasks.items[previous_index]);
                     model.popup = .{ .error_message = "Taskの順序を保存できませんでした。" };
+                    model.activity.add("> Move task up", "Save failed", false);
                 } else {
                     model.selected -= 1;
+                    model.activity.add("> Move task up", "Saved", true);
                 }
             },
             .move_down => if (model.selected + 1 < visible_count and selected_index != null) {
@@ -1324,8 +1439,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, environ: *const std.process
                 if (!persist(allocator, io, path, data)) {
                     std.mem.swap(store.Task, &data.tasks.items[selected_index.?], &data.tasks.items[next_index]);
                     model.popup = .{ .error_message = "Taskの順序を保存できませんでした。" };
+                    model.activity.add("> Move task down", "Save failed", false);
                 } else {
                     model.selected += 1;
+                    model.activity.add("> Move task down", "Saved", true);
                 }
             },
             .add => model.popup = .{ .input = InputState.init(.task_add, null, "") },
@@ -1469,10 +1586,12 @@ fn handleRepositoryKey(
                         node.load_attempted = true;
                         node.load_error = githubIssueErrorMessage(err);
                         model.popup = .{ .error_message = githubIssueErrorMessage(err) };
+                        model.activity.add("> Load repository Issues", githubIssueErrorMessage(err), false);
                         return;
                     };
                     node.load_attempted = true;
                     node.load_error = null;
+                    model.activity.add("> Load repository Issues", "Loaded", true);
                 }
                 node.expanded = true;
             }
@@ -1484,6 +1603,7 @@ fn handleRepositoryKey(
                 node.load_attempted = true;
                 node.load_error = githubIssueErrorMessage(err);
                 model.popup = .{ .error_message = githubIssueErrorMessage(err) };
+                model.activity.add("> Refresh repository Issues", githubIssueErrorMessage(err), false);
                 return;
             };
             if (node.issues) |*previous| previous.deinit();
@@ -1491,6 +1611,7 @@ fn handleRepositoryKey(
             node.load_attempted = true;
             node.load_error = null;
             node.expanded = true;
+            model.activity.add("> Refresh repository Issues", "Loaded", true);
             model.issue_body_scroll = 0;
             if (model.repository_issue_selected) |selected| {
                 if (selected >= loaded.items.len) model.repository_issue_selected = if (loaded.items.len == 0) null else loaded.items.len - 1;
@@ -1564,14 +1685,20 @@ fn copySelectedRepositoryIssuePrompt(allocator: std.mem.Allocator, io: std.Io, c
     defer allocator.free(prompt);
     clipboard.copy(allocator, io, prompt) catch |err| {
         model.popup = .{ .error_message = proposalImportErrorMessage(err) };
+        model.activity.add("> Copy Issue prompt", proposalImportErrorMessage(err), false);
+        return;
     };
+    model.activity.add("> Copy Issue prompt", "Copied to Clipboard", true);
 }
 
 fn openSelectedRepositoryIssueInBrowser(allocator: std.mem.Allocator, io: std.Io, config: *const ?github_config.Config, tree: *RepositoryTree, model: *Model) !void {
     const selected = selectedRepositoryIssue(if (config.*) |*value| value else null, tree, model.*) orelse return;
     github_client.openWeb(allocator, io, selected.repository, selected.number) catch |err| {
         model.popup = .{ .error_message = githubIssueErrorMessage(err) };
+        model.activity.add("> Open Issue in browser", githubIssueErrorMessage(err), false);
+        return;
     };
+    model.activity.add("> Open Issue in browser", "Opened", true);
 }
 
 fn openIssues(
@@ -1591,12 +1718,14 @@ fn openIssues(
     }
     const loaded = github_client.listOpenMany(allocator, io, current.repositories) catch |err| {
         model.popup = .{ .error_message = githubIssueErrorMessage(err) };
+        model.activity.add("> Load all Issues", githubIssueErrorMessage(err), false);
         return;
     };
     if (issues.*) |*previous| previous.deinit();
     issues.* = loaded;
     model.issue_selected = 0;
     model.screen = .issues;
+    model.activity.add("> Load all Issues", "Loaded", true);
 }
 
 fn handleIssueKey(
@@ -1629,8 +1758,10 @@ fn handleIssueKey(
             defer allocator.free(prompt);
             clipboard.copy(allocator, io, prompt) catch |err| {
                 model.popup = .{ .error_message = proposalImportErrorMessage(err) };
+                model.activity.add("> Copy Issue prompt", proposalImportErrorMessage(err), false);
                 return;
             };
+            model.activity.add("> Copy Issue prompt", "Copied to Clipboard", true);
             model.screen = .repositories;
             model.focus = .tasks;
         },
@@ -1638,7 +1769,10 @@ fn handleIssueKey(
             const selected = current.items[model.issue_selected];
             github_client.openWeb(allocator, io, selected.repository, selected.number) catch |err| {
                 model.popup = .{ .error_message = githubIssueErrorMessage(err) };
+                model.activity.add("> Open Issue in browser", githubIssueErrorMessage(err), false);
+                return;
             };
+            model.activity.add("> Open Issue in browser", "Opened", true);
         },
         .help => model.popup = .help,
         .quit => model.screen = .repositories,
@@ -1694,15 +1828,18 @@ fn importProposalFromClipboard(
     }
     const bytes = clipboard.read(allocator, io) catch |err| {
         model.popup = .{ .error_message = proposalImportErrorMessage(err) };
+        model.activity.add("> Read Proposal from Clipboard", proposalImportErrorMessage(err), false);
         return;
     };
     defer allocator.free(bytes);
     importProposalBytes(allocator, io, proposal_path, proposal, bytes) catch |err| {
         model.popup = .{ .error_message = proposalImportErrorMessage(err) };
+        model.activity.add("> Import Proposal", proposalImportErrorMessage(err), false);
         return;
     };
     model.proposal_selected = 0;
     model.popup = null;
+    model.activity.add("> Import Proposal", "Imported and saved", true);
 }
 
 fn importProposalBytes(
@@ -1799,6 +1936,7 @@ fn applyInput(
         .task_add => {
             const task = data.add(input.value()) catch |err| {
                 input.error_message = inputErrorMessage(err);
+                model.activity.add("> Add task", inputErrorMessage(err), false);
                 return;
             };
             const id = task.id;
@@ -1806,11 +1944,13 @@ fn applyInput(
                 const removed = data.delete(id) catch unreachable;
                 data.freeTask(removed);
                 model.popup = .{ .error_message = " Taskを保存できませんでした。" };
+                model.activity.add("> Add task", "Save failed", false);
                 return;
             }
             model.show_all_tasks = true;
             model.selected = data.tasks.items.len - 1;
             model.popup = null;
+            model.activity.add("> Add task", "Saved", true);
         },
         .task_edit => {
             const id = input.target_id orelse return;
@@ -1822,6 +1962,7 @@ fn applyInput(
             defer allocator.free(previous);
             const changed = data.edit(id, input.value()) catch |err| {
                 input.error_message = inputErrorMessage(err);
+                model.activity.add("> Edit task", inputErrorMessage(err), false);
                 return;
             };
             if (!changed) {
@@ -1831,9 +1972,11 @@ fn applyInput(
             if (!persist(allocator, io, path, data)) {
                 _ = data.edit(id, previous) catch {};
                 model.popup = .{ .error_message = " Taskの編集を保存できませんでした。" };
+                model.activity.add("> Edit task", "Save failed", false);
                 return;
             }
             model.popup = null;
+            model.activity.add("> Edit task", if (changed) "Saved" else "No changes", true);
         },
         .proposal_add => {
             const value = if (proposal.*) |*current| current else return;
@@ -1912,9 +2055,11 @@ fn toggleTaskAt(allocator: std.mem.Allocator, io: std.Io, path: []const u8, data
     if (!persist(allocator, io, path, data)) {
         _ = data.toggle(id) catch {};
         model.popup = .{ .error_message = " 完了状態を保存できませんでした。" };
+        model.activity.add("> Toggle task completion", "Save failed", false);
         return;
     }
     model.popup = null;
+    model.activity.add("> Toggle task completion", "Saved", true);
 }
 
 fn setTaskIssue(allocator: std.mem.Allocator, io: std.Io, path: []const u8, data: *store.Data, model: *Model, index: usize, selected: ?github_client.IssueSummary) !void {
@@ -1935,15 +2080,18 @@ fn setTaskIssue(allocator: std.mem.Allocator, io: std.Io, path: []const u8, data
     } else null;
     const changed = data.setIssue(task.id, replacement) catch {
         model.popup = .{ .error_message = " TaskをIssueへ紐付けできませんでした。" };
+        model.activity.add("> Update task Issue", "Update failed", false);
         return;
     };
     if (!changed) return;
     if (!persist(allocator, io, path, data)) {
         _ = data.setIssue(task.id, previous) catch {};
         model.popup = .{ .error_message = " TaskのIssue紐付けを保存できませんでした。" };
+        model.activity.add("> Update task Issue", "Save failed", false);
         return;
     }
     model.popup = null;
+    model.activity.add("> Update task Issue", if (selected == null) "Unlinked and saved" else "Linked and saved", true);
 }
 
 fn applyConfirmation(
@@ -1967,6 +2115,7 @@ fn applyConfirmation(
             if (!persist(allocator, io, path, data)) {
                 data.tasks.insertAssumeCapacity(target.index, deleted);
                 model.popup = .{ .error_message = " Taskの削除を保存できませんでした。" };
+                model.activity.add("> Delete task", "Save failed", false);
                 return;
             }
             data.freeTask(deleted);
@@ -1976,17 +2125,20 @@ fn applyConfirmation(
                 model.selected = data.tasks.items.len - 1;
             }
             model.popup = null;
+            model.activity.add("> Delete task", "Deleted and saved", true);
         },
         .clear_tasks => {
             var empty = store.Data.init(allocator);
             defer empty.deinit();
             if (!persist(allocator, io, path, &empty)) {
                 model.popup = .{ .error_message = " 全Taskの削除を保存できませんでした。" };
+                model.activity.add("> Clear all tasks", "Save failed", false);
                 return;
             }
             _ = data.clear();
             model.selected = 0;
             model.popup = null;
+            model.activity.add("> Clear all tasks", "Cleared and saved", true);
         },
         .delete_proposal_task => |index| {
             const value = if (proposal.*) |*current| current else return;
@@ -2007,6 +2159,7 @@ fn applyConfirmation(
             const value = if (proposal.*) |*current| current else return;
             _ = proposal_apply.applyProposal(allocator, io, path, proposal_path, value) catch {
                 model.popup = .{ .error_message = " Proposalを承認できませんでした。TaskとProposalは保持されています。" };
+                model.activity.add("> Approve Proposal", "Failed; tasks and Proposal kept", false);
                 return;
             };
             const loaded = store.load(allocator, io, path) catch {
@@ -2022,6 +2175,7 @@ fn applyConfirmation(
             model.selected = if (data.tasks.items.len == 0) 0 else data.tasks.items.len - 1;
             model.proposal_selected = 0;
             model.popup = null;
+            model.activity.add("> Approve Proposal", "Tasks added and linked", true);
         },
         .delete_repository => |index| {
             const value = if (config.*) |*current| current else return;
@@ -2106,6 +2260,38 @@ test "model selection stays within task bounds" {
     try std.testing.expectEqual(@as(usize, 0), model.selected);
     model.update(.quit, 2);
     try std.testing.expect(model.quit);
+}
+
+test "activity pane shows one entry normally and three while focused" {
+    var model: Model = .{};
+    model.activity.add("> first", "one", true);
+    model.activity.add("> second", "two", true);
+    model.activity.add("> third", "three", false);
+
+    var compact_buffer: [4096]u8 = undefined;
+    var compact_writer: std.Io.Writer = .fixed(&compact_buffer);
+    try renderActivity(&compact_writer, model, .{ .top = 1, .left = 1, .width = 40, .height = activity_height }, false);
+    const compact = compact_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, compact, "> third") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compact, "> second") == null);
+
+    model.focus = .activity;
+    var expanded_buffer: [4096]u8 = undefined;
+    var expanded_writer: std.Io.Writer = .fixed(&expanded_buffer);
+    try renderActivity(&expanded_writer, model, .{ .top = 1, .left = 1, .width = 40, .height = activity_focused_height }, false);
+    const expanded = expanded_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "> first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "> second") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "> third") != null);
+}
+
+test "activity log is bounded and sanitizes terminal controls" {
+    var log: ActivityLog = .{};
+    var index: usize = 0;
+    while (index < max_activity_entries + 3) : (index += 1) log.add("> command\x1b", "line\nresponse", true);
+    try std.testing.expectEqual(@as(usize, max_activity_entries), log.count);
+    try std.testing.expect(std.mem.indexOfScalar(u8, log.entries[0].command.value(), 0x1b) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, log.entries[0].response.value(), '\n') == null);
 }
 
 test "tasks issue panes and prompt popup render with contextual help" {
